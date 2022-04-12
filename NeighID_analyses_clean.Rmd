@@ -1,0 +1,4819 @@
+---
+title: "R analyses for Ulbrich et al. 2021 SBB" 
+author: "Tayler Ulbrich"
+date: "April 2022"
+output: pdf
+editor_options: 
+  chunk_output_type: console
+---
+
+# Set working directory and load packages
+```{r load_packages, include=F}
+
+setwd("C:/Users/Tayler Ulbrich/Documents/GitHub/SwitchgrassNeighborRhizosphere/")
+
+# Load Phyloseq: 
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+ #   install.packages("BiocManager")
+library(BiocManager)
+#BiocManager::install("phyloseq")
+#BiocManager::install("mixOmics")
+#BiocManager::install("microbiome")
+  
+library(mixOmics)
+library(magrittr)
+library(phyloseq)
+library(microbiome)
+library(scales)
+library(grid)
+library(ggplot2)
+library(vegan)
+library(multcomp)
+library(multcompView)
+library(lme4)
+library(lmerTest)
+library(ggpubr)
+library(car)
+library(lsmeans)
+library(dplyr)
+library(ape)
+library(MASS)
+library(stats)
+library(tidyr)
+library(tibble)
+theme_set(theme_classic())
+
+```
+---
+# Load Pre-Filtered Bacterial Data 
+```{r}
+
+###############
+# Raw (& removed singletons)
+###############
+
+# ALL SAMPLES (bact.raw)
+load(file = "PhyloseqObjects/NeighID_all_16S_Nosingles_raw.Rdata")
+
+# Greenhouse samples only (bact.raw_GH)
+load(file = "PhyloseqObjects/NeighID_GH_16S_Nosingles_raw.Rdata")
+ 
+# Soil Incubation samples only (bact.raw_SoilInc)
+load(file = "PhyloseqObjects/NeighID_SoilInc_16S_Nosingles_raw.Rdata")
+###############
+# Rarefied (and removed any OTUs not present in @ least 10 samples)
+###############
+
+# ALL SAMPLES (bact.rfy)
+load(file = "PhyloseqObjects/NeighID_16S_all_rfy_pub.Rdata")
+
+## Greenhouse only (bact.rfy_GH)
+load(file = "PhyloseqObjects/NeighID_16S_GH_rfy_pub.Rdata")
+
+
+## Soil Incubation (bact.rfy_SoilInc)
+load(file = "PhyloseqObjects/NeighID_16S_SoilInc_rfy_pub.Rdata")
+
+
+
+###########
+# Metadata for each subset of samples
+##########
+
+sampledata.all <- as(sample_data(bact.rfy),"data.frame")
+
+sampledata.GH <- as(sample_data(bact.rfy_GH),"data.frame")
+
+sampledata.SoilInc <- as(sample_data(bact.rfy_SoilInc),"data.frame")
+
+
+```
+## Subset for samples from greenhouse focal plants  
+```{r}
+
+bact.rfy_GH_focal <- subset_samples(bact.rfy_GH, sample_data(bact.rfy_GH)$position_name == "focal")
+nsamples(bact.rfy_GH_focal)#25 
+
+# make sure we only have the taxa that are in this dataset 
+bact.rfy_GH_focal <- prune_taxa(taxa_sums(bact.rfy_GH_focal) > 0, bact.rfy_GH_focal)
+ntaxa(bact.rfy_GH_focal) 
+
+#sampledata
+sampledata.GH_focal <- as(sample_data(bact.rfy_GH_focal),"data.frame")
+
+```
+---
+# Exudate Data
+## Before analyses, subset for knowns & Impute NAs
+```{r}
+# Exudates were only collected from the greenhouse focal plants (n = 25)
+
+# first subset dataset into all metabolite features and identified (known) exudates
+# then we impute the missing data (NAs) for downstream statistical analyses using the ‘MissForest’ R package (Stekhoven and Bühlmann, 2012). 
+
+
+
+Metab <- read.csv("Exudates/Ulbrich_NeighID_Exudates_FilteredScaled_all.csv", header = TRUE)
+dim(Metab)#29 14649
+
+
+# load metadata file with X.SampleID as the column with the same sample ids as MSdata
+Metab_metadata <- read.csv("Metadata/Ulbrich_NeighID_Metadata_Published.csv", header = T)
+Metab_metadata <- filter(Metab_metadata, Experiment == "Greenhouse" & position_name == "focal")
+
+
+# Merge metadata with metab_scaled so that we can add X.SampleID as rownames (match bacterial datasets)
+library(plyr)
+Metab2 <- join(Metab_metadata[c(1,7)], Metab, by = "ExudateID", type = "inner")
+dim(Metab2) # 25 14650
+
+# Make Exudate ID rownames so they remain with distance metrix. 
+library(tibble)
+Metab2 <- column_to_rownames(Metab2, "X.SampleID")
+library(dplyr)
+Metab2 <- select(Metab2, -ExudateID)
+rownames(Metab2)
+dim(Metab2) #25 14698
+
+#write.csv(Metab2, "Exudates/LCGCMS_Metabolites_Scaled_ALL_raw.csv", row.names = TRUE)
+
+
+###############################
+#  IMPUTE NAs
+    ###  Impute the NAs of your dataset, this generates a random, small number to fill the NAs.
+  #https://www.analyticsvidhya.com/blog/2016/03/tutorial-powerful-packages-imputing-missing-values/
+  # Missforest is recommended and is used for non-parametric data  (also see:https://www.mdpi.com/2218-1989/4/2/433/html)
+  # In simple words, it builds a random forest model for each variable.
+    #Then it uses the model to predict missing values in the variable with the help of observed values.
+
+#####
+# ALL Metabolites
+
+library(missForest) #nonparametric imputation method with random forest algorithm
+Metab_imputed_data<- missForest(Metab2, maxiter = 5, ntree = 10)
+# this took overnight to run 
+
+# make into a df &  see if there are still neg #s
+Metab_imputed <- as.data.frame(Metab_imputed_data$ximp) #check imputed values
+has.neg <- apply(Metab_imputed, 1, function(row) any(row < 0)) 
+which(has.neg) # none
+
+Metab_imputed_data$OOBerror # reports imputation error 
+  # 0.0636 - 6.4% error for variables imputed 
+
+row.names(Metab_imputed) # confirm that rownames are X.SampleID 
+
+#write.csv(Metab_imputed, "Exudates/LCGCMS_Metabolites_Scaled_ALL_Imputed.csv", row.names = TRUE)
+
+
+######################################################
+# Subset for known Metabolites
+library(dplyr)
+Metab2_knowns <- Metab2 %>% select (-starts_with("unkown"))
+dim(Metab2_knowns) # 25 140
+rownames(Metab2_knowns)
+
+#write.csv(Metab2_knowns, "Exudates/LCGCMS_Metabolites_Scaled_Known_raw.csv", row.names = TRUE)
+
+
+# Impute KNOWNS 
+
+library(missForest) #nonparametric imputation method with random forest algorithm
+Metab_knowns_imputed_data<- missForest(Metab_knowns, maxiter = 5, ntree = 10) 
+
+# make into a df &  see if there are still neg #s
+Metab_knowns_imputed <- as.data.frame(Metab_knowns_imputed_data$ximp) #check imputed values
+has.neg <- apply(Metab_knowns_imputed, 1, function(row) any(row < 0)) 
+which(has.neg) # none
+
+Metab_knowns_imputed_data$OOBerror # reports imputation error 
+  # 0.0183 - so only 1.8% error for variables imputed 
+
+row.names(Metab_knowns_imputed) # confirm that rownames are X.SampleID 
+
+#write.csv(Metab_knowns_imputed, "Exudates/LCGCMS_Metabolites_Scaled_Known_Imputed.csv", row.names = TRUE)
+
+
+```
+
+## Load Exudate Data 
+```{r}
+# Data imputed with MissForest (see code above 'Subset metabolites by knowns & impute')
+
+
+# load metadata file with X.SampleID as the column with the same sample ids as MSdata
+Metab_metadata <- read.csv("Metadata/Ulbrich_NeighID_Metadata_Published.csv", header = T)
+Metab_metadata <- filter(Metab_metadata, Experiment == "Greenhouse" & position_name == "focal")
+dim(Metab_metadata) # 25 50 
+rownames(Metab_metadata) <- Metab_metadata$X.SampleID
+
+# make sure that columns are numeric (columns 14-34 are factors and should be numeric)
+i <- c(14:34) # which columns to change 
+Metab_metadata[,i] <- apply(Metab_metadata[, i], 2, 
+                      function(x) as.numeric(as.character(x)))
+
+
+
+# ALL 
+Metab_imputed <- read.csv("Exudates/LCGCMS_Metabolites_Scaled_ALL_Imputed.csv", header = TRUE, row.names = 1)
+dim(Metab_imputed) # 25 14648 
+
+# Knowns 
+Metab_knowns_imputed <- read.csv("Exudates/LCGCMS_Metabolites_Scaled_Known_Imputed.csv", header = TRUE, row.names = 1)
+dim(Metab_knowns_imputed) # 25 140 
+
+
+
+```
+---
+# GREENHOUSE (GH) BACTERIA
+## Summarize dominant taxa by treatment 
+```{r}
+# Create summary data on the dominate phylum, etc.https://github.com/joey711/phyloseq/issues/418
+
+
+library("phyloseq")
+library("data.table")
+library("ggplot2")
+
+fast_melt = function(physeq){
+  # supports "naked" otu_table as `physeq` input.
+  otutab = as(otu_table(physeq), "matrix")
+  if(!taxa_are_rows(physeq)){otutab <- t(otutab)}
+  otudt = data.table(otutab, keep.rownames = TRUE)
+  setnames(otudt, "rn", "taxaID")
+  # Enforce character taxaID key
+  otudt[, taxaIDchar := as.character(taxaID)]
+  otudt[, taxaID := NULL]
+  setnames(otudt, "taxaIDchar", "taxaID")
+  # Melt count table
+  mdt = melt.data.table(otudt, 
+                        id.vars = "taxaID",
+                        variable.name = "SampleID",
+                        value.name = "count")
+  # Remove zeroes, NAs
+  mdt <- mdt[count > 0][!is.na(count)]
+  # Calculate relative abundance
+  mdt[, RelativeAbundance := count / sum(count), by = SampleID]
+  if(!is.null(tax_table(physeq, errorIfNULL = FALSE))){
+    # If there is a tax_table, join with it. Otherwise, skip this join.
+    taxdt = data.table(as(tax_table(physeq, errorIfNULL = TRUE), "matrix"), keep.rownames = TRUE)
+    setnames(taxdt, "rn", "taxaID")
+    # Enforce character taxaID key
+    taxdt[, taxaIDchar := as.character(taxaID)]
+    taxdt[, taxaID := NULL]
+    setnames(taxdt, "taxaIDchar", "taxaID")
+    # Join with tax table
+    setkey(taxdt, "taxaID")
+    setkey(mdt, "taxaID")
+    mdt <- taxdt[mdt]
+  }
+  return(mdt)
+}
+
+summarize_taxa = function(physeq, Rank, GroupBy = NULL){
+  Rank <- Rank[1]
+  if(!Rank %in% rank_names(physeq)){
+    message("The argument to `Rank` was:\n", Rank,
+            "\nBut it was not found among taxonomic ranks:\n",
+            paste0(rank_names(physeq), collapse = ", "), "\n",
+            "Please check the list shown above and try again.")
+  }
+  if(!is.null(GroupBy)){
+    GroupBy <- GroupBy[1]
+    if(!GroupBy %in% sample_variables(physeq)){
+      message("The argument to `GroupBy` was:\n", GroupBy,
+              "\nBut it was not found among sample variables:\n",
+              paste0(sample_variables(physeq), collapse = ", "), "\n",
+              "Please check the list shown above and try again.")
+    }
+  }
+  # Start with fast melt
+  mdt = fast_melt(physeq)
+  if(!is.null(GroupBy)){
+    # Add the variable indicated in `GroupBy`, if provided.
+    sdt = data.table(SampleID = sample_names(physeq),
+                     var1 = get_variable(physeq, GroupBy))
+    setnames(sdt, "var1", GroupBy)
+    # Join
+    setkey(sdt, SampleID)
+    setkey(mdt, SampleID)
+    mdt <- sdt[mdt]
+  }
+  # Summarize
+Nsamples = nsamples(physeq)
+  summarydt = mdt[, list(meanRA = sum(RelativeAbundance)/Nsamples,
+                         sdRA = sd(RelativeAbundance),
+                         minRA = min(RelativeAbundance),
+                         maxRA = max(RelativeAbundance)),
+                  by = c(Rank, GroupBy)]
+  return(summarydt)
+}
+
+plot_taxa_summary = function(physeq, Rank, GroupBy = NULL){
+  # Get taxa summary table 
+  dt1 = summarize_taxa(physeq, Rank = Rank, GroupBy = GroupBy)
+  # Set factor appropriately for plotting
+  RankCol = which(colnames(dt1) == Rank)
+  setorder(dt1, -meanRA)
+  dt1[, RankFac := factor(dt1[[Rank]], 
+                          levels = rev(dt1[[Rank]]))]
+  dt1[, ebarMax := max(c(0, min(meanRA + sdRA))), by = eval(Rank)]
+  dt1[, ebarMin := max(c(0, min(meanRA - sdRA))), by = eval(Rank)]
+  # Set zeroes to one-tenth the smallest value
+  ebarMinFloor = dt1[(ebarMin > 0), min(ebarMin)]
+  ebarMinFloor <- ebarMinFloor / 10
+  dt1[(ebarMin == 0), ebarMin := ebarMinFloor]
+
+  pRank = ggplot(dt1, aes(x = meanRA, y = RankFac)) +
+    scale_x_log10() +
+    xlab("Mean Relative Abundance") +
+    ylab(Rank) +
+    theme_bw()
+  if(!is.null(GroupBy)){
+    # pRank <- pRank + facet_wrap(facets = as.formula(paste("~", GroupBy)))
+    pRank <- pRank + geom_point(mapping = aes_string(colour = GroupBy),
+                                size = 5)
+  } else {
+    # Don't include error bars for faceted version
+    pRank <- pRank + geom_errorbarh(aes(xmax = ebarMax,
+                                        xmin = ebarMin))
+  }
+  return(pRank)
+}
+
+# Relative abundance of Phyla across all treatments 
+plot_taxa_summary(bact.rfy_GH, "Phylum") # mean rel abund of phyla 
+bact.rfy_GH_phyla_summary <- summarize_taxa(bact.rfy_GH, "Phylum")
+bact.rfy_GH_phyla_trt <- summarize_taxa(bact.rfy_GH, "Phylum", "treatment")
+
+# Relative abundance of Phyla across all focal plant treatments  
+plot_taxa_summary(bact.rfy_GH_focal, "Phylum") # mean rel abund of phyla 
+bact.rfy_GH_focal_phyla_summary <- summarize_taxa(bact.rfy_GH_focal, "Phylum")
+bact.rfy_GH_focal_phyla_trt <- summarize_taxa(bact.rfy_GH_focal, "Phylum", "treatment")
+
+# Relative abundance of Phyla across species 
+
+bact.rfy_GH.mono <- subset_samples(bact.rfy_GH, treatment == "SL_SL" | treatment == "BBS_BBS" | treatment == "S_S" | treatment == "JG_JG")
+nsamples(bact.rfy_GH.mono) # n = 40 good 
+
+plot_taxa_summary(bact.rfy_GH.mono, "Phylum") # mean rel abund of phyla 
+bact.rfy_GH.mono_phyla_summary <- summarize_taxa(bact.rfy_GH.mono, "Phylum")
+bact.rfy_GH.mono_phyla_trt <- summarize_taxa(bact.rfy_GH.mono, "Phylum")
+
+
+```
+
+
+
+##  GH alpha diversity 
+Resource: https://rpubs.com/dillmcfarlan/R_microbiota_BRC2017
+```{r}
+# Maybe you should only use raw data for the shannon and chao1 estimate? https://github.com/joey711/phyloseq/issues/287
+
+# Rarefied 
+GH_diversity_rfy <- estimate_richness(bact.rfy_GH, measures = c("Chao1","Observed", "Shannon"))
+GH_diversity_rfy$Evenness_Pielou <- GH_diversity_rfy$Shannon/log(GH_diversity_rfy$Observed)
+GH_diversity_rfy$X.SampleID <- rownames(GH_diversity_rfy) # move rownames as sampleID
+
+GH_diversity_rfy<- merge(GH_diversity_rfy, sampledata.GH, by = "X.SampleID")
+
+```
+### Focal Alpha Diversity 
+####Shannon 
+```{r}
+
+library(dplyr)
+GH_diversity_rfy.focal <- filter(GH_diversity_rfy, position_name == "focal")
+dim(GH_diversity_rfy.focal) # 25 
+
+ggqqplot(GH_diversity_rfy.focal$Shannon)
+hist(GH_diversity_rfy.focal$Shannon)
+
+GH.focal_Shannon = lm(Shannon ~ treatment , data =   GH_diversity_rfy.focal)
+res = resid(GH.focal_Shannon)
+shapiro.test(res) 
+
+# homoegeneity of variances
+bartlett.test(Shannon ~ treatment, data = GH_diversity_rfy.focal) 
+
+Anova(GH.focal_Shannon, type = "III")
+
+# pairwise test (gives you p.values for every combination)
+emmeans(GH.focal_Shannon, pairwise ~ treatment, adjust = "fdr")
+
+# OR DO THIS (gives you letter assignments)
+
+marginal = emmeans(GH.focal_Shannon, ~ treatment, adjust = "fdr")
+pairs(marginal)
+cld(marginal, Letters=letters)
+
+##############
+# Does this differ if we control for focal plant biomass (competitive effect)?
+##############
+GH.focal_ShannonBiomass = lm(Shannon ~ treatment + AG_g, data = GH_diversity_rfy.focal)
+res = resid(GH.focal_ShannonBiomass)
+shapiro.test(res) 
+
+Anova(GH.focal_ShannonBiomass, type = "III")
+
+# pairwise test (gives you p.values for every combination)
+emmeans(GH.focal_ShannonBiomass, pairwise ~ treatment, adjust = "fdr")
+
+# letter assignment for pairwise diffs 
+marginal = emmeans(GH.focal_ShannonBiomass, ~ treatment)
+pairs(marginal)
+cld(marginal, Letters=letters)
+```
+#### Chao1 
+```{r}
+
+library(dplyr)
+GH_diversity_rfy.focal <- filter(GH_diversity_rfy, position_name == "focal")
+
+ggqqplot(GH_diversity_rfy.focal$Chao1)
+hist(GH_diversity_rfy.focal$Chao1)
+
+GH.focal_Chao1 = lm(Chao1 ~ treatment , data =   GH_diversity_rfy.focal)
+plot(GH.focal_Chao1)
+res = resid(GH.focal_Chao1)
+shapiro.test(res) 
+
+# homoegeneity of variances
+bartlett.test(Chao1 ~ treatment, data = GH_diversity_rfy.focal) 
+
+Anova(GH.focal_Chao1, type = "III")
+
+
+# pairwise test (gives you p.values for every combination)
+emmeans(GH.focal_Chao1, pairwise ~ treatment, adjust = "fdr")
+
+# letter assignment for pairwise diffs
+marginal = emmeans(GH.focal_Chao1, ~ treatment)
+pairs(marginal)
+cld(marginal, Letters=letters)
+
+##############
+# Does this differ if we control for focal plant biomass (competitive effect)?
+##############
+GH.focal_Chao1Biomass = lm(Chao1 ~ treatment+ AG_g, data =   GH_diversity_rfy.focal)
+res = resid(GH.focal_Chao1Biomass)
+shapiro.test(res) 
+
+Anova(GH.focal_Chao1Biomass, type = "III")
+
+# pairwise test (gives you p.values for every combination)
+emmeans(GH.focal_Chao1Biomass, pairwise ~ treatment, adjust = "fdr")
+#letter assignment for pairwise diffs
+marginal = emmeans(GH.focal_Chao1Biomass, ~ treatment)
+pairs(marginal)
+cld(marginal, Letters=letters)
+
+
+```
+#### Evenness_Pielou 
+```{r}
+
+library(dplyr)
+GH_diversity_rfy.focal <- filter(GH_diversity_rfy, position_name == "focal")
+dim(GH_diversity_rfy.focal) # 25 
+ 
+ggqqplot(GH_diversity_rfy.focal$Evenness_Pielou)
+hist(GH_diversity_rfy.focal$Evenness_Pielou)
+
+GH.focal_Evenness_Pielou = lm(Evenness_Pielou ~ treatment , data =  GH_diversity_rfy.focal)
+res = resid(GH.focal_Evenness_Pielou)
+shapiro.test(res) 
+
+# homoegeneity of variances
+bartlett.test(Evenness_Pielou ~ treatment, data = GH_diversity_rfy.focal) 
+
+Anova(GH.focal_Evenness_Pielou, type = "III")
+
+##############
+# Does this differ if we control for focal plant biomass (competitive effect)?
+##############
+GH.focal_Evenness_PielouBiomass = lm(Evenness_Pielou ~ treatment + AG_g, data =   GH_diversity_rfy.focal)
+res = resid(GH.focal_Evenness_PielouBiomass)
+shapiro.test(res) 
+
+Anova(GH.focal_Evenness_PielouBiomass, type = "III")
+
+```
+
+## Monoculture alpha diversity 
+```{r}
+# subst for only the monoculture treatments  
+GH_diversity_rfy.mono <- filter(GH_diversity_rfy, treatment == "SL_SL" | treatment == "BBS_BBS" | treatment == "S_S" | treatment == "JG_JG")
+dim(GH_diversity_rfy.mono) # n = 40 
+
+```
+###Shannon 
+```{r}
+
+ggqqplot(GH_diversity_rfy.mono$Shannon)
+hist(GH_diversity_rfy.mono$Shannon)
+
+GH.mono_Shannon = lm(Shannon ~ treatment , data =   GH_diversity_rfy.mono)
+res = resid(GH.mono_Shannon)
+shapiro.test(res) 
+
+# homoegeneity of variances
+bartlett.test(Shannon ~ treatment, data = GH_diversity_rfy.mono) 
+
+Anova(GH.mono_Shannon, type = "III")
+
+# pairwise test (gives you p.values for every combination)
+emmeans(GH.mono_Shannon, pairwise ~ treatment, adjust = "fdr")
+
+# OR DO THIS (gives you letter assignments)
+
+marginal = emmeans(GH.mono_Shannon, ~ treatment)
+pairs(marginal)
+cld(marginal, Letters=letters)
+
+##############
+# Does this differ if we control for focal plant biomass (competitive effect)?
+##############
+GH.mono_ShannonBiomass = lm(Shannon ~ treatment + AG_g, data = GH_diversity_rfy.mono)
+res = resid(GH.mono_ShannonBiomass)
+shapiro.test(res) 
+plot(GH.mono_ShannonBiomass)
+
+Anova(GH.mono_ShannonBiomass, type = "III")
+
+# pairwise test (gives you p.values for every combination)
+emmeans(GH.mono_ShannonBiomass, pairwise ~ treatment, adjust = "fdr")
+
+# OR DO THIS (gives you letter assignments)
+marginal = emmeans(GH.mono_ShannonBiomass, ~ treatment)
+pairs(marginal)
+cld(marginal, Letters=letters)
+
+```
+#### Chao1 
+```{r}
+ggqqplot(GH_diversity_rfy.mono$Chao1)
+hist(GH_diversity_rfy.mono$Chao1)
+
+GH.mono_Chao1 = lm(Chao1 ~ treatment , data =   GH_diversity_rfy.mono)
+plot(GH.mono_Chao1)
+res = resid(GH.mono_Chao1)
+shapiro.test(res) 
+
+# homoegeneity of variances
+bartlett.test(Chao1 ~ treatment, data = GH_diversity_rfy.mono) 
+
+Anova(GH.mono_Chao1, type = "III")
+
+
+# pairwise test (gives you p.values for every combination)
+emmeans(GH.mono_Chao1, pairwise ~ treatment, adjust = "fdr")
+
+# OR DO THIS (gives you letter assignments)
+marginal = emmeans(GH.mono_Chao1, ~ treatment)
+pairs(marginal)
+cld(marginal, Letters=letters)
+
+
+
+##############
+# Does this differ if we control for focal plant biomass (competitive effect)?
+##############
+GH.mono_Chao1Biomass = lm(Chao1 ~ treatment+ AG_g, data =   GH_diversity_rfy.mono)
+res = resid(GH.mono_Chao1Biomass)
+shapiro.test(res) 
+
+Anova(GH.mono_Chao1Biomass, type = "III")
+
+# pairwise test (gives you p.values for every combination)
+emmeans(GH.mono_Chao1Biomass, pairwise ~ treatment, adjust = "fdr")
+# OR DO THIS (gives you letter assignments)
+marginal = emmeans(GH.mono_Chao1Biomass, ~ treatment)
+pairs(marginal)
+cld(marginal, Letters=letters)
+
+
+```
+#### Evenness_Pielou 
+```{r}
+ggqqplot(GH_diversity_rfy.mono$Evenness_Pielou)
+hist(GH_diversity_rfy.mono$Evenness_Pielou)
+
+GH.mono_Evenness_Pielou = lm(Evenness_Pielou ~ treatment , data =  GH_diversity_rfy.mono)
+res = resid(GH.mono_Evenness_Pielou)
+shapiro.test(res) 
+
+# homoegeneity of variances
+bartlett.test(Evenness_Pielou ~ treatment, data = GH_diversity_rfy.mono) 
+
+Anova(GH.mono_Evenness_Pielou, type = "III")
+
+##############
+# Does this differ if we control for focal plant biomass (competitive effect)?
+##############
+GH.mono_Evenness_PielouBiomass = lm(Evenness_Pielou ~ treatment + AG_g, data =   GH_diversity_rfy.mono)
+res = resid(GH.mono_Evenness_PielouBiomass)
+shapiro.test(res) 
+
+Anova(GH.mono_Evenness_PielouBiomass, type = "III")
+
+#########
+#### PLOT 
+bact.GH_focal_colors.cb <- c("#009E73", "#E69F00", "#56B4E9", "#0072B2", "#F0E442")
+
+ggplot(data = GH_diversity_rfy.mono, aes(x = treatment, y = Evenness_Pielou, fill = treatment)) + 
+  #geom_boxplot(aes(factor(treatment), fill = factor(treatment))) + 
+  theme_classic() + 
+  geom_violin(trim = FALSE) +
+  geom_dotplot(binaxis = "y", stackdir = "center", fill = "lightgray")  +
+  stat_summary(fun.data="mean_sdl",  fun.args = list(mult=1)) +
+  #scale_fill_manual(values = bact.GH_focal_colors.cb)+
+  labs(x = "plant treatment", y = "GH Focal Evenness_Pielou (rarified data)") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25)) + 
+  theme(axis.title = element_text(size = 25)) + 
+  theme(axis.text.y = element_text(size = 25)) +
+  theme(legend.title = element_text(size = 25)) + 
+  theme(legend.text = element_text(size = 20)) + 
+  theme(axis.title.x = element_text(size = 25)) + 
+  theme(axis.text.x = element_text(size = 20)) + 
+  guides(fill = guide_legend(title = "treatment")) 
+
+
+```
+---
+## GH Betadiversity
+
+### Focal Betadiversity by treatment (all taxa)
+```{r}
+
+# remove sample that is an outlier for soil moisture 
+bact.rfy_GH_focal.noOut <- subset_samples(bact.rfy_GH_focal, X.SampleID != "TMCneighID44") 
+nsamples(bact.rfy_GH_focal.noOut)
+
+
+# Weighted Unifrac
+set.seed(2)
+bact.rfy_GH_focal_wuni<- phyloseq::distance(bact.rfy_GH_focal, "wunifrac")
+
+
+# Beta-Dispersion test & PERMANOVA 
+  # permonva adonis test assumes equal variance among the groups, so we need to betadispersion (tests if there is a differences in the spread/dispersial/variability among groups) 
+
+# w. unifrac
+set.seed(2)
+betadisp <- betadisper(bact.rfy_GH_focal_wuni,group = sampledata.GH_focal$treatment,type = "centroid")
+permutest(betadisp) 
+boxplot(betadisp) 
+
+# pairwise betadispersion 
+betadisp.TukeyHSD <- TukeyHSD(betadisp, conf.level = 0.95)
+betadisp.TukeyHSD
+
+set.seed(2)
+permanova.wuni <- adonis2(bact.rfy_GH_focal_wuni~sample_data(bact.rfy_GH_focal)$treatment, permutations = 9999, method = "wunifrac", by = "margin")
+permanova.wuni
+
+# Pairwise Adonis 
+library(RVAideMemoire)
+vector <- as.vector(sample_data(bact.rfy_GH_focal.noOut)$treatment)
+pairwise.perm.manova(bact.rfy_GH_focal_wuni, vector, p.method = "fdr")
+
+###################
+# Control for effect of competition (focal plant AG biomass)
+
+## Permanova
+# If you don't want the order to matter you can use adonis2 with by="margin", or if you want to check if the model as a whole is significant you can use by=NULL. (https://stats.stackexchange.com/questions/476256/adonis-vs-adonis2)
+set.seed(2)
+bact.rfy_GH_focal_wuni<- phyloseq::distance(bact.rfy_GH_focal, "wunifrac")
+
+set.seed(2)
+permanova.wuni.ag <- adonis2(bact.rfy_GH_focal_wuni~sample_data(bact.rfy_GH_focal)$treatment + sample_data(bact.rfy_GH_focal)$AG_g, permutations = 9999, method = "wunifrac", by = "margin")
+permanova.wuni.ag
+
+##################################
+# Do plants that share the exact same pot have distinct bacterial communities? 
+
+# subset for only focal plant treatments 
+bact.rfy_GH.focalTrt <- subset_samples(bact.rfy_GH, treatment == "SL_SL" | treatment == "SL_BBS" | treatment == "SL_JG" | treatment == "SL_S")
+
+sampledata_focalTrt <- as.data.frame(as(sample_data(bact.rfy_GH.focalTrt),"matrix"))
+
+#calculate distance matrix
+
+set.seed(2)
+bact.rfy_GH.focalTrt_wuni<- phyloseq::distance(bact.rfy_GH.focalTrt, "wunifrac")
+
+
+set.seed(2)
+permanova.wuni.trtpos <- adonis(bact.rfy_GH.focalTrt_wuni~sampledata_focalTrt$treatment*sampledata_focalTrt$position_name, permutations = 9999, method = "wunifrac", by = "margin")
+permanova.wuni.trtpos
+
+
+```
+
+### Focal Betadiversity - Dominant & Non-dominant taxa 
+```{r}
+
+# Dominant taxa = top 10% 
+ntaxa(bact.rfy_GH_focal) # 5713 (so top 10% is 571 taxa)
+top10 = names(sort(taxa_sums(bact.rfy_GH_focal), TRUE)[1:571])
+bact.rfy_GH_focal.top10 = prune_taxa(top10, bact.rfy_GH_focal)
+ntaxa(bact.rfy_GH_focal.top10) # 571
+sum(sample_sums(bact.rfy_GH_focal.top10))/sum(sample_sums(bact.rfy_GH_focal))
+# 70% of reads 
+
+# Non-dominant (lower 90% abundance) 
+remainingtaxa = names(sort(taxa_sums(bact.rfy_GH_focal), TRUE)[572:5713])
+bact.rfy_GH_focal.remain = prune_taxa(remainingtaxa, bact.rfy_GH_focal)
+ntaxa(bact.rfy_GH_focal.remain) # 5142
+sum(sample_sums(bact.rfy_GH_focal.remain))/sum(sample_sums(bact.rfy_GH_focal))
+# 30% of reads 
+
+
+##########
+# DOMINANT TAXA 
+set.seed(2)
+bact.rfy_GH_focal.dominant_wuni<- phyloseq::distance(bact.rfy_GH_focal.top10, "wunifrac")
+
+set.seed(2)
+betadisp <- betadisper(bact.rfy_GH_focal.dominant_wuni,group = sample_data(bact.rfy_GH_focal.top10)$treatment,type = "centroid")
+permutest(betadisp) 
+boxplot(betadisp) 
+
+# pairwise betadispersion 
+betadisp.TukeyHSD <- TukeyHSD(betadisp, conf.level = 0.95)
+betadisp.TukeyHSD
+
+set.seed(2)
+permanova.wuni <- adonis2(bact.rfy_GH_focal.dominant_wuni~sample_data(bact.rfy_GH_focal.top10)$treatment, permutations = 9999, method = "wunifrac", by = "margin")
+permanova.wuni
+
+# Pairwise Adonis 
+library(RVAideMemoire)
+vector <- as.vector(sample_data(bact.rfy_GH_focal.top10)$treatment)
+pairwise.perm.manova(bact.rfy_GH_focal.dominant_wuni, vector, p.method = "fdr")
+
+#### CONTROL FOR AG biomass/Competition Effect 
+
+set.seed(2)
+permanova.wuni.top.ag <- adonis2(bact.rfy_GH_focal.dominant_wuni~sample_data(bact.rfy_GH_focal.top10)$treatment + sample_data(bact.rfy_GH_focal.top10)$AG_g, permutations = 9999, method = "wunifrac", by = "margin")
+permanova.wuni.top.ag
+
+###############
+# Non-Dominant Taxa 
+
+# Weighted unifrac 
+set.seed(2)
+bact.rfy_GH_focal.rare_wuni<- phyloseq::distance(bact.rfy_GH_focal.remain, "wunifrac")
+  
+set.seed(2)
+betadisp <- betadisper(bact.rfy_GH_focal.rare_wuni,group = sample_data(bact.rfy_GH_focal.remain)$treatment,type = "centroid")
+permutest(betadisp) 
+boxplot(betadisp) 
+
+# pairwise betadispersion 
+betadisp.TukeyHSD <- TukeyHSD(betadisp, conf.level = 0.95)
+betadisp.TukeyHSD
+
+set.seed(2)
+permanova.wuni <- adonis2(bact.rfy_GH_focal.rare_wuni~sample_data(bact.rfy_GH_focal.remain)$treatment, permutations = 9999, method = "wunifrac", by = "margin")
+permanova.wuni
+
+# Pairwise Adonis 
+library(RVAideMemoire)
+vector <- as.vector(sample_data(bact.rfy_GH_focal.remain)$treatment)
+pairwise.perm.manova(bact.rfy_GH_focal.rare_wuni, vector, p.method = "fdr")
+
+#### CONTROL FOR AG biomass/Competition Effect 
+
+# Weighted unifrac 
+set.seed(2)
+bact.rfy_GH_focal.rare_wuni<- phyloseq::distance(bact.rfy_GH_focal.remain, "wunifrac")
+set.seed(2)
+permanova.wuni.rare.ag <- adonis2(bact.rfy_GH_focal.rare_wuni~sample_data(bact.rfy_GH_focal.remain)$treatment + sample_data(bact.rfy_GH_focal.remain)$AG_g, permutations = 9999, method = "wunifrac", by = "margin")
+permanova.wuni.rare.ag
+
+library(RVAideMemoire)
+vector <- as.vector(sample_data(bact.rfy_GH_focal)$treatment)
+pairwise.perm.manova(bact.rfy_GH_focal.rare_wuni, vector, p.method = "fdr")
+
+
+```
+### Monoculture Betadiversity by treatment
+```{r}
+# subst for only the monoculture treatments  
+bact.rfy.GH.mono  <- subset_samples(bact.rfy_GH, treatment == "SL_SL" | treatment == "BBS_BBS" | treatment == "S_S" | treatment == "JG_JG")
+nsamples(bact.rfy.GH.mono) # n = 40 good 
+
+
+# Distances for Ordination 
+# look for stress values around 0.2
+# Goal is to use the min.#axes for which stress is low
+set.seed(2)
+bact.rfy.GH.mono_w.unifrac.NMDS <- ordinate(bact.rfy.GH.mono, method = "NMDS", distance = "wunifrac" ) 
+
+
+set.seed(2)
+bact.rfy.GH.mono_uw.unifrac.NMDS <- ordinate(bact.rfy.GH.mono, method = "NMDS", distance = "unifrac" ) # stress is nearly zero 
+  
+
+# plot Ordination 
+
+sample_data(bact.rfy.GH.mono)$treatment <- factor(sample_data(bact.rfy.GH.mono)$treatment , levels = c("SL_SL","BBS_BBS","JG_JG","S_S"))
+bact.GH_mono_colors.cb <- c( "darkgreen",  "mediumblue", "mediumorchid4","darkgoldenrod1") # specify colors
+
+
+
+ plot_ordination(bact.rfy.GH.mono, ordination = bact.rfy.GH.mono_w.unifrac.NMDS, color = "treatment",title = "Mono merged W.unifrac/NMDS") + 
+   scale_color_manual(values = bact.GH_mono_colors.cb)+
+  geom_point(size = 5)+ 
+  theme(plot.title = element_text(size = 16)) + 
+  theme(axis.title.x = element_text(size = 25)) + 
+  theme(axis.title.y = element_text(size = 25)) + 
+  theme(axis.text.x = element_text(size = 20, color = "black"))  + 
+  theme(axis.text.y = element_text(size = 20, color = "black"))  + 
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=2))+
+  theme(legend.text = element_text(size = 25)) + 
+  theme(legend.position="right") +  
+   # legend.title = element_text(size = 40)) +
+  theme(plot.margin=unit(c(.5,1,.5,.5),"cm"))  
+  # stat_ellipse(type = "t")
+ 
+  #scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) + 
+   #scale_x_continuous(labels = scales::number_format(accuracy = 0.01)) # change axes to only have 2 decimals
+
+
+ ###############
+ # STATS 
+
+### Betadispersion and permanova   
+
+set.seed(2)
+bact.rfy.GH.mono_uw.uni<- phyloseq::distance(bact.rfy.GH.mono, "unifrac")
+set.seed(2)
+bact.rfy.GH.mono_w.uni <- phyloseq::distance(bact.rfy.GH.mono, "wunifrac" )
+
+# Beta-Dispersion test
+  # permonva adonis test assumes equal variance among the groups, so we need to check this first 
+  # this tests if there is a differences in the spread/dispersial/variability among groups 
+set.seed(2)
+betadisp <- betadisper(bact.rfy.GH.mono_w.uni,group = sample_data(bact.rfy.GH.mono)$treatment,type = "centroid")
+permutest(betadisp) 
+boxplot(betadisp)
+
+
+# pairwise betadispersion 
+betadisp.TukeyHSD <- TukeyHSD(betadisp, conf.level = 0.95)
+betadisp.TukeyHSD
+
+
+
+## Permanova
+
+set.seed(2)
+permanova <- adonis(bact.rfy.GH.mono_w.uni~sample_data(bact.rfy.GH.mono)$treatment, permutations = 9999, method = "wunifrac")
+permanova
+
+
+## Include plant aboveground biomass 
+set.seed(2)
+adonis(bact.rfy.GH.mono_w.uni~sample_data(bact.rfy.GH.mono)$treatment +sample_data(bact.rfy.GH.mono)$AG_g , permutations = 9999, method = "wunifrac")
+
+
+
+# Pairwise Adonis 
+library(RVAideMemoire)
+
+vector <- as.vector(sample_data(bact.rfy.GH.mono)$treatment)
+mono.wuni.pairwise <- pairwise.perm.manova(bact.rfy.GH.mono_w.uni, vector, p.method = "fdr")
+mono.wuni.pairwise
+
+
+```
+
+
+---
+### Controlling/Synergistic/Neutral Effect of Neighbors on Focal Microbiome
+```{r}
+# Here we compare the focal and neighbor microbiomes in neighborhood treatments to their microbiomes in monoculture treatments using PermANOVA and NMDS. This helps us understand if the focal microbiome is becoming more similar or dissimilar to its neighbor. If more similar to the neighbor, this would suggest that the neighbor has a controlling effect on the focal plant microbiome. This is a similar approach to Hausmann & Hawkes et al. 2009 
+
+
+# SL = P.virgatum (southlow variety)
+# BBS = A.gerardii
+# JG = K.macrantha
+# S = R.hirta 
+
+# Treatment names are noted with speceis identfier (above) and underscore; e.g. SL_SL is the P.virgatum monoculture, while SL_S is P.virgatum neighbored by R.hirta 
+
+
+#  make a variable that separates by treatment and position 
+sampledata.GH$treatment.pos <- paste(sampledata.GH$treatment, sampledata.GH$position_name, sep = ".")
+
+#  make a variable that separates by treatment and host
+sampledata.GH$treatment.host <- paste(sampledata.GH$treatment, sampledata.GH$host_species, sampledata.GH$Rep, sep = ".")
+
+sample_data(bact.rfy_GH) <- sampledata.GH
+
+
+# merge samples from the same treatment and rep so that the monocultures are a merged representative of both species in the pot 
+bact.rfy_GH_treatment.host <- merge_samples(bact.rfy_GH, 'treatment.host', fun = mean)
+nsamples(bact.rfy_GH_treatment.host)# 63 
+
+# Merge_samples messes up metadata - remove the data columns and only keep the unique treatment.host rows for the SL_S, SL_BBS, SL_JG merged otu sampledata 
+sampledata.GH.merged <- select(sampledata.GH, "X.SampleID", "potID","Rep","treatment","treatment.pos", "treatment.host")
+
+sampledata.GH.merged <- distinct(sampledata.GH.merged, treatment.host, .keep_all = TRUE)
+dim(sampledata.GH.merged) # 63 5 
+
+rownames(sampledata.GH.merged) <- sampledata.GH.merged$treatment.host
+sample_data(bact.rfy_GH_treatment.host) <- sampledata.GH.merged
+
+# SL_SL 
+bact.rfy.GH_SLcomp <- subset_samples(bact.rfy_GH_treatment.host, treatment == "SL_SL") 
+
+### SL_S
+bact.rfy.GH_Scomp <- subset_samples(bact.rfy_GH_treatment.host, treatment == "SL_SL" | treatment == "SL_S" | treatment == "S_S")
+nsamples(bact.rfy.GH_Scomp) # 20 
+
+### SL_BBS 
+bact.rfy.GH_BBScomp <- subset_samples(bact.rfy_GH_treatment.host, treatment == "SL_SL" | treatment == "SL_BBS" | treatment == "BBS_BBS")
+nsamples(bact.rfy.GH_BBScomp) # 20 
+
+### SL_JG 
+bact.rfy.GH_JGcomp <- subset_samples(bact.rfy_GH_treatment.host, treatment == "SL_SL" | treatment == "SL_JG" | treatment == "JG_JG")
+nsamples(bact.rfy.GH_JGcomp) # 20
+
+```
+#### Effects on Dominant Taxa 
+```{r}
+
+## Dominant taxa = top 10% 
+ntaxa(bact.rfy_GH_focal) # 5713 (so top 10% is 571 taxa)
+top10 = names(sort(taxa_sums(bact.rfy_GH_focal), TRUE)[1:571])
+bact.rfy_GH_focal.top10 = prune_taxa(top10, bact.rfy_GH_focal)
+ntaxa(bact.rfy_GH_focal.top10) # 571
+
+
+bact.rfy.GH_SLcomp.top <- prune_taxa(top10, bact.rfy.GH_SLcomp) 
+
+bact.rfy.GH_Scomp.top <- prune_taxa(top10, bact.rfy.GH_Scomp) 
+
+bact.rfy.GH_JGcomp.top <- prune_taxa(top10, bact.rfy.GH_JGcomp) 
+
+bact.rfy.GH_BBScomp.top <- prune_taxa(top10, bact.rfy.GH_BBScomp) 
+
+#####
+####  Stats - weighted unifrac permANOVA 
+
+#SL_S
+ set.seed(2)
+wuni.SLS.top <- phyloseq::distance(bact.rfy.GH_Scomp.top, "wunifrac")
+
+set.seed(2)
+perm.wuni.SLS.top <- adonis2(wuni.SLS.top~sample_data(bact.rfy.GH_Scomp.top)$treatment.pos, permutations = 9999, method = "wunifrac", by = "margin")
+perm.wuni.SLS.top
+
+# Pairwise Adonis 
+library(RVAideMemoire)
+vector <- as.vector(sample_data(bact.rfy.GH_Scomp.top)$treatment.pos)
+pairwise.perm.manova(wuni.SLS.top, vector, p.method = "fdr")
+
+#SL_BBS
+ set.seed(2)
+wuni.SLBBS.top <- phyloseq::distance(bact.rfy.GH_BBScomp.top, "wunifrac")
+
+set.seed(2)
+perm.wuni.SLBBS.top <- adonis2(wuni.SLBBS.top~sample_data(bact.rfy.GH_BBScomp.top)$treatment.pos, permutations = 9999, method = "wunifrac", by = "margin")
+perm.wuni.SLBBS.top
+
+# Pairwise Adonis 
+library(RVAideMemoire)
+vector <- as.vector(sample_data(bact.rfy.GH_BBScomp.top)$treatment.pos)
+pairwise.perm.manova(wuni.SLBBS.top, vector, p.method = "fdr")
+
+
+#SL_JG
+ set.seed(2)
+wuni.SLJG.top <- phyloseq::distance(bact.rfy.GH_JGcomp.top, "wunifrac")
+
+set.seed(2)
+perm.wuni.SLJG.top <- adonis2(wuni.SLJG.top~sample_data(bact.rfy.GH_JGcomp.top)$treatment.pos, permutations = 9999, method = "wunifrac", by = "margin")
+perm.wuni.SLJG.top
+
+# Pairwise Adonis 
+library(RVAideMemoire)
+vector <- as.vector(sample_data(bact.rfy.GH_JGcomp.top)$treatment.pos)
+pairwise.perm.manova(wuni.SLJG.top, vector, p.method = "fdr")
+
+
+```
+##### Figure 2 A-C: Dominant Taxa Neighborhood vs. Monoculture Effects 
+```{r}
+##### SL_BBS 
+set.seed(2)
+bact.rfy.GH_BBScomp.top_wuni.NMDS <- ordinate(bact.rfy.GH_BBScomp.top, method = "NMDS", distance = "unifrac", weighted = TRUE )
+
+# extract out x and y dimensions from ordination 
+BBScomp.top_w.unifrac.points <- as.data.frame(bact.rfy.GH_BBScomp.top_wuni.NMDS$points)
+BBScomp.top_w.unifrac.points <- rownames_to_column(BBScomp.top_w.unifrac.points, "treatment.host")
+
+# merge with metadata 
+BBScomp.top_w.unifrac.points.m <- merge(BBScomp.top_w.unifrac.points, sampledata.GH, by = "treatment.host")
+
+
+# calculate the mean and se of the points from the ordination by treatment 
+BBScomp.top_w.unifrac.points.mean <- BBScomp.top_w.unifrac.points.m %>%
+      group_by(treatment.pos) %>% 
+  summarise(Mean_MDS1 = mean(MDS1), 
+            SD_MDS1 = sd(MDS1), 
+            N = n(),
+            SE_MDS1 = SD_MDS1/sqrt(N), 
+            Mean_MDS2 = mean(MDS2), 
+            SD_MDS2 = sd(MDS2), 
+            N = n(),
+            SE_MDS2 = SD_MDS2/sqrt(N), 
+                        ) 
+
+# Reorder so that all plots are the same
+BBScomp.top_w.unifrac.points.mean$treatment.pos <- factor(BBScomp.top_w.unifrac.points.mean$treatment.pos, levels = c("BBS_BBS.bbs", "SL_SL.neighbor", "SL_BBS.focal","SL_BBS.neighbor"), labels = c("Neighbor in monoculture", "Focal in monoculture ", "Focal in neighborhood", "Neighbor in neighborhood"))
+
+BBS.colors <- c("slategray1","darkcyan","darkcyan","slategray1")
+Synergy.shapes <- c(0,0,16,16)
+
+
+BBS_centroid.top <- ggplot(data=BBScomp.top_w.unifrac.points.mean,aes(x=Mean_MDS1, y= Mean_MDS2))+
+  geom_errorbar(aes(ymax = Mean_MDS2 + SE_MDS2, ymin = Mean_MDS2 - SE_MDS2, width = .001))+ 
+ geom_errorbarh(aes(xmax = Mean_MDS1 + SE_MDS1, xmin = Mean_MDS1 - SE_MDS1, height = .001)) +
+  geom_point(aes(color = treatment.pos, shape = treatment.pos),size = 4, stroke = 2) +
+  scale_shape_manual(values = Synergy.shapes) +
+  scale_color_manual(values = BBS.colors) +
+    labs(x = "NMDS1", y = "NMDS2") +
+ ggtitle("A.gerardii") +
+  theme(plot.title = element_text(size = 40, face = "italic"),
+  axis.title.x = element_text(size = 15), 
+  axis.title.y = element_text(size = 15), 
+  axis.text.x = element_blank(), 
+  axis.text.y = element_blank(), 
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 25), 
+  legend.title = element_text(size = 40), 
+  legend.position="none",  #remove legend  
+  plot.margin=unit(c(.5,1,.5,.5),"cm"))  # add margins
+
+
+# SL_JG 
+set.seed(2)
+bact.rfy.GH_JGcomp.top_wuni.NMDS <- ordinate(bact.rfy.GH_JGcomp.top, method = "NMDS", distance = "unifrac", weighted = TRUE)
+
+# extract out x and y dimensions from ordination 
+JGcomp.top_w.unifrac.points <- as.data.frame(bact.rfy.GH_JGcomp.top_wuni.NMDS$points)
+JGcomp.top_w.unifrac.points <- rownames_to_column(JGcomp.top_w.unifrac.points, "treatment.host")
+
+# merge with metadata 
+JGcomp.top_w.unifrac.points.m <- merge(JGcomp.top_w.unifrac.points, sampledata.GH, by = "treatment.host")
+
+
+# calculate the mean and se of the points from the ordination by treatment 
+JGcomp.top_w.unifrac.points.mean <- JGcomp.top_w.unifrac.points.m %>%
+      group_by(treatment.pos) %>% 
+  summarise(Mean_MDS1 = mean(MDS1), 
+            SD_MDS1 = sd(MDS1), 
+            N = n(),
+            SE_MDS1 = SD_MDS1/sqrt(N), 
+            Mean_MDS2 = mean(MDS2), 
+            SD_MDS2 = sd(MDS2), 
+            N = n(),
+            SE_MDS2 = SD_MDS2/sqrt(N), 
+                        ) 
+
+# Reorder so that all plots are the same
+JGcomp.top_w.unifrac.points.mean$treatment.pos <- factor(JGcomp.top_w.unifrac.points.mean$treatment.pos, levels = c("JG_JG.jg", "SL_SL.neighbor", "SL_JG.focal","SL_JG.neighbor"), labels = c("Neighbor in monoculture", "Focal in monoculture ", "Focal in neighborhood", "Neighbor in neighborhood"))
+
+JG.colors <- c("thistle3","darkcyan","darkcyan","thistle3")
+Synergy.shapes <- c(0,0,16,16)
+
+
+JG_centroid.top <- ggplot(data=JGcomp.top_w.unifrac.points.mean,aes(x=Mean_MDS1, y= Mean_MDS2))+
+  geom_errorbar(aes(ymax = Mean_MDS2 + SE_MDS2, ymin = Mean_MDS2 - SE_MDS2, width = .001))+ 
+ geom_errorbarh(aes(xmax = Mean_MDS1 + SE_MDS1, xmin = Mean_MDS1 - SE_MDS1, height = .001)) +
+  geom_point(aes(color = treatment.pos, fill = treatment.pos, shape = treatment.pos),size = 4, stroke = 2) +
+  scale_shape_manual(values = Synergy.shapes) +
+  scale_color_manual(values = JG.colors) + 
+    labs(x = "NMDS1", y = "NMDS2") +
+  ggtitle("K.macrantha") +
+  theme(plot.title = element_text(size = 40, face = "italic"),
+  axis.title.x = element_text(size = 15), 
+  axis.title.y = element_text(size = 15), 
+  axis.text.x = element_blank(), 
+  axis.text.y = element_blank(), 
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 25), 
+  legend.title = element_text(size = 40), 
+  legend.position="none",  #remove legend  
+  plot.margin=unit(c(.5,1,.5,.5),"cm"))  # add margins
+
+
+
+# SL_S 
+set.seed(2)
+bact.rfy.GH_Scomp.top_wuni.NMDS <- ordinate(bact.rfy.GH_Scomp.top, method = "NMDS", distance = "unifrac", weighted = TRUE )
+
+
+# extract out x and y dimensions from ordination 
+Scomp.top_w.unifrac.points <- as.data.frame(bact.rfy.GH_Scomp.top_wuni.NMDS$points)
+Scomp.top_w.unifrac.points <- rownames_to_column(Scomp.top_w.unifrac.points, "treatment.host")
+
+# merge with metadata 
+Scomp.top_w.unifrac.points.m <- merge(Scomp.top_w.unifrac.points, sampledata.GH, by = "treatment.host")
+
+
+
+
+# calculate the mean and se of the points from the ordination by treatment 
+Scomp.top_w.unifrac.points.mean <- Scomp.top_w.unifrac.points.m %>%
+      group_by(treatment.pos) %>% 
+  summarise(Mean_MDS1 = mean(MDS1), 
+            SD_MDS1 = sd(MDS1), 
+            N = n(),
+            SE_MDS1 = SD_MDS1/sqrt(N), 
+            Mean_MDS2 = mean(MDS2), 
+            SD_MDS2 = sd(MDS2), 
+            N = n(),
+            SE_MDS2 = SD_MDS2/sqrt(N), 
+                        ) 
+
+# Reorder so that all plots are the same
+Scomp.top_w.unifrac.points.mean$treatment.pos <- factor(Scomp.top_w.unifrac.points.mean$treatment.pos, levels = c("S_S.s", "SL_SL.neighbor", "SL_S.focal","SL_S.neighbor"), labels = c("Neighbor in monoculture", "Focal in monoculture ", "Focal in neighborhood", "Neighbor in neighborhood"))
+
+S.colors <- c("lightgoldenrod", "darkcyan","darkcyan","lightgoldenrod")
+Synergy.shapes <- c(0,0,16,16)
+
+
+S_centroid.top <- ggplot(data=Scomp.top_w.unifrac.points.mean,aes(x=Mean_MDS1, y= Mean_MDS2))+
+  geom_errorbar(aes(ymax = Mean_MDS2 + SE_MDS2, ymin = Mean_MDS2 - SE_MDS2, width = .001))+ 
+ geom_errorbarh(aes(xmax = Mean_MDS1 + SE_MDS1, xmin = Mean_MDS1 - SE_MDS1, height = .001)) +
+  geom_point(aes(color = treatment.pos, fill = treatment.pos, shape = treatment.pos),size = 4, stroke = 2) +
+  scale_shape_manual(values = Synergy.shapes) +
+  scale_color_manual(values = S.colors) + 
+    labs(x = "NMDS1", y = "NMDS2") +
+  ggtitle("R.hirta") +
+  theme(plot.title = element_text(size = 40, face = "italic"),
+  axis.title.x = element_text(size = 15), 
+  axis.title.y = element_text(size = 15), 
+  axis.text.x = element_blank(), 
+  axis.text.y = element_blank(), 
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 25), 
+  legend.title = element_text(size = 40), 
+  legend.position="none",  #remove legend  
+  plot.margin=unit(c(.5,1,.5,.5),"cm"))  # add margins
+
+
+```
+#### Effects on Non-dominant taxa 
+```{r}
+
+# Non-dominant (lower 90% abundance) 
+remainingtaxa = names(sort(taxa_sums(bact.rfy_GH_focal), TRUE)[572:5713])
+bact.rfy_GH_focal.remain = prune_taxa(remainingtaxa, bact.rfy_GH_focal)
+ntaxa(bact.rfy_GH_focal.remain) # 5142
+
+
+bact.rfy.GH_SLcomp.nd <- prune_taxa(remainingtaxa, bact.rfy.GH_SLcomp) 
+
+bact.rfy.GH_Scomp.nd <- prune_taxa(remainingtaxa, bact.rfy.GH_Scomp) 
+
+bact.rfy.GH_JGcomp.nd <- prune_taxa(remainingtaxa, bact.rfy.GH_JGcomp) 
+
+bact.rfy.GH_BBScomp.nd <- prune_taxa(remainingtaxa, bact.rfy.GH_BBScomp) 
+
+##### Stats - weighted unifrac - permANOVA 
+
+#SL_S
+ set.seed(2)
+wuni.SLS.nd <- phyloseq::distance(bact.rfy.GH_Scomp.nd, "wunifrac")
+
+set.seed(2)
+perm.wuni.SLS.nd <- adonis2(wuni.SLS.nd~sample_data(bact.rfy.GH_Scomp.nd)$treatment.pos, permutations = 9999, method = "wunifrac", by = "margin")
+perm.wuni.SLS.nd
+
+# Pairwise Adonis 
+library(RVAideMemoire)
+vector <- as.vector(sample_data(bact.rfy.GH_Scomp.nd)$treatment.pos)
+pairwise.perm.manova(wuni.SLS.nd, vector, p.method = "fdr")
+
+#SL_BBS
+ set.seed(2)
+wuni.SLBBS.nd <- phyloseq::distance(bact.rfy.GH_BBScomp.nd, "wunifrac")
+
+set.seed(2)
+perm.wuni.SLBBS.nd <- adonis2(wuni.SLBBS.nd~sample_data(bact.rfy.GH_BBScomp.nd)$treatment.pos, permutations = 9999, method = "wunifrac", by = "margin")
+perm.wuni.SLBBS.nd
+
+# Pairwise Adonis 
+library(RVAideMemoire)
+vector <- as.vector(sample_data(bact.rfy.GH_BBScomp.nd)$treatment.pos)
+pairwise.perm.manova(wuni.SLBBS.nd, vector, p.method = "fdr")
+
+
+#SL_JG
+ set.seed(2)
+wuni.SLJG.nd <- phyloseq::distance(bact.rfy.GH_JGcomp.nd, "wunifrac")
+
+set.seed(2)
+perm.wuni.SLJG.nd <- adonis2(wuni.SLJG.nd~sample_data(bact.rfy.GH_JGcomp.nd)$treatment.pos, permutations = 9999, method = "wunifrac", by = "margin")
+perm.wuni.SLJG.nd
+
+# Pairwise Adonis 
+library(RVAideMemoire)
+vector <- as.vector(sample_data(bact.rfy.GH_JGcomp.nd)$treatment.pos)
+pairwise.perm.manova(wuni.SLJG.nd, vector, p.method = "fdr")
+
+
+```
+##### Figure 2 D-F:  Non-Dominant Taxa Neighborhood vs. Monoculture Effects 
+```{r}
+##### SL_BBS 
+set.seed(2)
+bact.rfy.GH_BBScomp.nd_wuni.NMDS <- ordinate(bact.rfy.GH_BBScomp.nd, method = "NMDS", distance = "unifrac", weighted = TRUE )
+
+# extract out x and y dimensions from ordination 
+BBScomp.nd_w.unifrac.points <- as.data.frame(bact.rfy.GH_BBScomp.nd_wuni.NMDS$points)
+BBScomp.nd_w.unifrac.points <- rownames_to_column(BBScomp.nd_w.unifrac.points, "treatment.host")
+
+# merge with metadata 
+BBScomp.nd_w.unifrac.points.m <- merge(BBScomp.nd_w.unifrac.points, sampledata.GH, by = "treatment.host")
+
+
+# calculate the mean and se of the points from the ordination by treatment 
+BBScomp.nd_w.unifrac.points.mean <- BBScomp.nd_w.unifrac.points.m %>%
+      group_by(treatment.pos) %>% 
+  summarise(Mean_MDS1 = mean(MDS1), 
+            SD_MDS1 = sd(MDS1), 
+            N = n(),
+            SE_MDS1 = SD_MDS1/sqrt(N), 
+            Mean_MDS2 = mean(MDS2), 
+            SD_MDS2 = sd(MDS2), 
+            N = n(),
+            SE_MDS2 = SD_MDS2/sqrt(N), 
+                        ) 
+
+# Reorder so that all plots are the same
+BBScomp.nd_w.unifrac.points.mean$treatment.pos <- factor(BBScomp.nd_w.unifrac.points.mean$treatment.pos, levels = c("BBS_BBS.bbs", "SL_SL.neighbor", "SL_BBS.focal","SL_BBS.neighbor"), labels = c("Neighbor in monoculture", "Focal in monoculture", "Focal in neighborhood", "Neighbor in neighborhood"))
+
+BBS.colors <- c("slategray1", "darkcyan","darkcyan","slategray1")
+Synergy.shapes <- c(0,0,16,16)
+
+
+BBS_centroid.nd <- ggplot(data=BBScomp.nd_w.unifrac.points.mean,aes(x=Mean_MDS1, y= Mean_MDS2))+
+  geom_errorbar(aes(ymax = Mean_MDS2 + SE_MDS2, ymin = Mean_MDS2 - SE_MDS2, width = .001))+ 
+ geom_errorbarh(aes(xmax = Mean_MDS1 + SE_MDS1, xmin = Mean_MDS1 - SE_MDS1, height = .001)) +
+  geom_point(aes(color = treatment.pos, fill = treatment.pos, shape = treatment.pos),size = 4, stroke = 2) +
+  scale_shape_manual(values = Synergy.shapes) +
+  scale_color_manual(values = BBS.colors) + 
+    labs(x = "NMDS1", y = "NMDS2") +
+ # ggtitle("A.gerardii") +
+  theme(plot.title = element_text(size = 40, face = "italic"),
+  axis.title.x = element_text(size = 15), 
+  axis.title.y = element_text(size = 15), 
+  axis.text.x = element_blank(), 
+  axis.text.y = element_blank(), 
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 25), 
+  legend.title = element_text(size = 40), 
+  legend.position="none",  #remove legend  
+  plot.margin=unit(c(.5,1,.5,.5),"cm"))  # add margins
+
+
+# SL_JG 
+set.seed(2)
+bact.rfy.GH_JGcomp.nd_wuni.NMDS <- ordinate(bact.rfy.GH_JGcomp.nd, method = "NMDS", distance = "unifrac", weighted = TRUE)
+
+# extract out x and y dimensions from ordination 
+JGcomp.nd_w.unifrac.points <- as.data.frame(bact.rfy.GH_JGcomp.nd_wuni.NMDS$points)
+JGcomp.nd_w.unifrac.points <- rownames_to_column(JGcomp.nd_w.unifrac.points, "treatment.host")
+
+# merge with metadata 
+JGcomp.nd_w.unifrac.points.m <- merge(JGcomp.nd_w.unifrac.points, sampledata.GH, by = "treatment.host")
+
+
+# calculate the mean and se of the points from the ordination by treatment 
+JGcomp.nd_w.unifrac.points.mean <- JGcomp.nd_w.unifrac.points.m %>%
+      group_by(treatment.pos) %>% 
+  summarise(Mean_MDS1 = mean(MDS1), 
+            SD_MDS1 = sd(MDS1), 
+            N = n(),
+            SE_MDS1 = SD_MDS1/sqrt(N), 
+            Mean_MDS2 = mean(MDS2), 
+            SD_MDS2 = sd(MDS2), 
+            N = n(),
+            SE_MDS2 = SD_MDS2/sqrt(N), 
+                        ) 
+
+# Reorder so that all plots are the same
+JGcomp.nd_w.unifrac.points.mean$treatment.pos <- factor(JGcomp.nd_w.unifrac.points.mean$treatment.pos, levels = c("JG_JG.jg", "SL_SL.neighbor", "SL_JG.focal","SL_JG.neighbor"), labels = c("Neighbor in monoculture", "Focal in monoculture", "Focal in neighborhood", "Neighbor in neighborhood"))
+
+JG.colors <- c("thistle3", "darkcyan","darkcyan","thistle3")
+Synergy.shapes <- c(0,0,16,16)
+
+
+JG_centroid.nd <- ggplot(data=JGcomp.nd_w.unifrac.points.mean,aes(x=Mean_MDS1, y= Mean_MDS2))+
+  geom_errorbar(aes(ymax = Mean_MDS2 + SE_MDS2, ymin = Mean_MDS2 - SE_MDS2, width = .001))+ 
+ geom_errorbarh(aes(xmax = Mean_MDS1 + SE_MDS1, xmin = Mean_MDS1 - SE_MDS1, height = .001)) +
+  geom_point(aes(color = treatment.pos, fill = treatment.pos, shape = treatment.pos),size = 4, stroke = 2) +
+  scale_shape_manual(values = Synergy.shapes) +
+  scale_color_manual(values = JG.colors) + 
+    labs(x = "NMDS1", y = "NMDS2") +
+  #ggtitle("K.macrantha") +
+  theme(plot.title = element_text(size = 40, face = "italic"),
+  axis.title.x = element_text(size = 15), 
+  axis.title.y = element_text(size = 15), 
+  axis.text.x = element_blank(), 
+  axis.text.y = element_blank(), 
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 25), 
+  legend.title = element_text(size = 40), 
+  legend.position="none",  #remove legend  
+  plot.margin=unit(c(.5,1,.5,.5),"cm"))  # add margins
+
+
+
+# SL_S 
+set.seed(2)
+bact.rfy.GH_Scomp.nd_wuni.NMDS <- ordinate(bact.rfy.GH_Scomp.nd, method = "NMDS", distance = "unifrac", weighted = TRUE )
+
+
+# extract out x and y dimensions from ordination 
+Scomp.nd_w.unifrac.points <- as.data.frame(bact.rfy.GH_Scomp.nd_wuni.NMDS$points)
+Scomp.nd_w.unifrac.points <- rownames_to_column(Scomp.nd_w.unifrac.points, "treatment.host")
+
+# merge with metadata 
+Scomp.nd_w.unifrac.points.m <- merge(Scomp.nd_w.unifrac.points, sampledata.GH, by = "treatment.host")
+
+
+
+
+# calculate the mean and se of the points from the ordination by treatment 
+Scomp.nd_w.unifrac.points.mean <- Scomp.nd_w.unifrac.points.m %>%
+      group_by(treatment.pos) %>% 
+  summarise(Mean_MDS1 = mean(MDS1), 
+            SD_MDS1 = sd(MDS1), 
+            N = n(),
+            SE_MDS1 = SD_MDS1/sqrt(N), 
+            Mean_MDS2 = mean(MDS2), 
+            SD_MDS2 = sd(MDS2), 
+            N = n(),
+            SE_MDS2 = SD_MDS2/sqrt(N), 
+                        ) 
+
+# Reorder so that all plots are the same
+Scomp.nd_w.unifrac.points.mean$treatment.pos <- factor(Scomp.nd_w.unifrac.points.mean$treatment.pos, levels = c("S_S.s", "SL_SL.neighbor", "SL_S.focal","SL_S.neighbor"), labels = c("Neighbor in monoculture", "Focal in monoculture", "Focal in neighborhood", "Neighbor in neighborhood"))
+
+S.colors <- c("lightgoldenrod", "darkcyan","darkcyan","lightgoldenrod")
+Synergy.shapes <- c(0,0,16,16)
+
+
+S_centroid.nd <- ggplot(data=Scomp.nd_w.unifrac.points.mean,aes(x=Mean_MDS1, y= Mean_MDS2))+
+  geom_errorbar(aes(ymax = Mean_MDS2 + SE_MDS2, ymin = Mean_MDS2 - SE_MDS2, width = .001))+ 
+ geom_errorbarh(aes(xmax = Mean_MDS1 + SE_MDS1, xmin = Mean_MDS1 - SE_MDS1, height = .001)) +
+  geom_point(aes(color = treatment.pos, fill = treatment.pos, shape = treatment.pos),size = 4, stroke = 2 ) +
+  scale_shape_manual(values = Synergy.shapes) +
+  scale_color_manual(values = S.colors) + 
+    labs(x = "NMDS1", y = "NMDS2") +
+  #ggtitle("R.hirta") +
+  theme(plot.title = element_text(size = 40, face = "italic"),
+  axis.title.x = element_text(size = 15), 
+  axis.title.y = element_text(size = 15), 
+  axis.text.x = element_blank(), 
+  axis.text.y = element_blank(), 
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 25), 
+  legend.title = element_text(size = 40), 
+  legend.position="none",  #remove legend  
+  plot.margin=unit(c(.5,1,.5,.5),"cm"))  # add margins
+
+
+################################################################
+
+#### Arrange dominant and non-dominant taxa plots together (published figure)
+library('ggpubr')
+
+ ggarrange(BBS_centroid.top, JG_centroid.top, S_centroid.top,BBS_centroid.nd, JG_centroid.nd, S_centroid.nd,
+                    labels = c("A", "B","C","D","E","F"),
+                    ncol = 3, nrow = 2, 
+                   heights = 1, widths = 2,
+                    common.legend = TRUE, legend = "none",
+            align = "hv")
+ 
+
+
+```
+---
+
+---
+## Indicator Species - Focal
+```{r}
+### Focal plant indicator bacterial genera by neighbor treatment. (Supplemental Table 3)
+
+# Remove anything less than something present in 1 sample (singletons)
+bact.rfy_GH_focal.removesing <- prune_taxa(taxa_sums(bact.rfy_GH_focal) > 1, bact.rfy_GH_focal)
+ntaxa(bact.rfy_GH_focal.removesing) - ntaxa(bact.rfy_GH_focal) #226
+ntaxa(bact.rfy_GH_focal.removesing) # 5487
+
+# data needs to have samples in rows and species in columns (opposite of phyloseq)
+bact.rfy_GH_focal.removesing_otu_t <- as.data.frame(t(as(otu_table(bact.rfy_GH_focal.removesing), "matrix")))
+dim(bact.rfy_GH_focal.removesing_otu_t) # 25 5487
+sampledata_bact.rfy_GH_focal.removesing<- as.data.frame(as(sample_data(bact.rfy_GH_focal.removesing),"matrix"))
+
+#############
+# multiplatt is the function used to conduct indicator species analysis
+  # duleg = T makes it so we avoid considering grouping combinations
+  # func = IndVal.g sets our test statistic as the INdVal index (returns sq.rt of IndVal)
+  # indvalcomp=TRUE will give us the separate A and B parameters for the indicator species. A indicates the probablity that the Sample belongs to the identified sample given the species in the sample (specificity); B is the probablity of finding the species in the sample belonging to that group (sensitivity) 
+
+library(indicspecies)
+# by variety 
+Focal_IndSp <- multipatt(bact.rfy_GH_focal.removesing_otu_t,
+                         sampledata_bact.rfy_GH_focal.removesing$treatment, duleg = TRUE, # in future make duleg = TRUE so it doesn't consider other site combinations
+                       control = how(nperm = 9999),func = "IndVal.g")
+
+
+
+# send ISA summary results to a file 
+ sink("2021.05.04_Focal_allOTUS_IndicSp_perm9999.csv")
+print(summary(Focal_IndSp, indvalcomp=TRUE))
+sink()
+# exported this table and organized into columns 
+
+###############################
+### Indicator Padjust#########
+
+# read in indicator taxa organized csv file 
+IndSp <- read.csv("2021.05.04_Focal_allOTUS_IndicSp_perm9999.csv", header = TRUE)
+
+# read in list of pvalues from primer pairwise analysis 
+IndSp_p <-IndSp$p.value
+
+# confirm that read list is a vector
+is.vector(IndSp_p)
+IndSp_p <- as.numeric(IndSp_p)
+
+library(stats)
+IndSp_p_fdr <- as.matrix(p.adjust(IndSp_p, method = "fdr", length(IndSp_p)))
+colnames(IndSp_p_fdr) <- "p_value_fdr"
+
+
+Tax <- as.data.frame(as(tax_table(bact.rfy_GH_focal.removesing),"matrix")) # taxonomy table with OTU column to merge with indsp results 
+Tax <- rownames_to_column(Tax, "OTU")
+IndSp_tax <- merge(Tax, IndSp, by = "OTU")
+
+
+IndSp_p_fdr_merge <- cbind(IndSp_tax, IndSp_p_fdr)
+
+#write.csv(IndSp_p_fdr_merge, "2021.05.04_Focal_allOTUS_IndicSp_perm9999_padjust.csv")
+
+
+```
+
+### Supplemental Figure 4: SL_S indicator genera presence in Monoculture Treatments 
+```{r}
+# first merge the monoculture treatments to reflect the neutral/synergistic graphs 
+
+#  make a variable that separates by treatment and position 
+sampledata.GH$treatment.pos <- paste(sampledata.GH$treatment, sampledata.GH$position_name, sep = ".")
+
+#  make a variable that separates by treatment and host
+sampledata.GH$treatment.host <- paste(sampledata.GH$treatment, sampledata.GH$host_species, sampledata.GH$Rep, sep = ".")
+
+sample_data(bact.rfy_GH) <- sampledata.GH
+
+# merge samples from the same treatment and rep so that the monocultures are a merged representative of both specise in the pot 
+bact.rfy_GH_treatment.host <- merge_samples(bact.rfy_GH, 'treatment.host', fun = mean)
+nsamples(bact.rfy_GH_treatment.host)# 63 
+
+# Merge_samples messes up metadata - remove the data columns and only keep the unique treatment.host rows for the SL_S, SL_BBS, SL_JG merged otu sampledata 
+sampledata.GH.merged <- select(sampledata.GH, "X.SampleID", "potID","Rep","treatment","treatment.pos", "treatment.host")
+sampledata.GH.merged <- distinct(sampledata.GH.merged, treatment.host, .keep_all = TRUE)
+dim(sampledata.GH.merged) # 63 5 
+
+rownames(sampledata.GH.merged) <- sampledata.GH.merged$treatment.host
+sample_data(bact.rfy_GH_treatment.host) <- sampledata.GH.merged
+
+# merge by genera and make into relative abundance 
+bact.rfy_GH_treatment.host.genera <- tax_glom(bact.rfy_GH_treatment.host, "Genus")
+
+bact.rfy_GH_treatment.host.genera.ra  = transform_sample_counts(bact.rfy_GH_treatment.host.genera, function(x) x / sum(x))
+
+
+# subset merged phyloseq object for some of SL_S indicator taxa (this was found in the focal indicator species table)
+bact.rfy.GH_Scomp.genera.ra.ind <- subset_taxa(bact.rfy_GH_treatment.host.genera.ra, Genus == "Zymomonas" | Genus == "Methylotenera" | Genus == "Caulobacter" | Genus == "Methylophilus" | Genus == "Flavobacterium")
+
+# subset for just the monoculture treatmetns 
+bact.rfy.GH_Scomp.genera.ra.ind.mono <- subset_samples(bact.rfy.GH_Scomp.genera.ra.ind, treatment == "SL_SL" | treatment == "S_S" | treatment == "BBS_BBS" | treatment == "JG_JG")
+nsamples(bact.rfy.GH_Scomp.genera.ra.ind.mono) # 20 
+
+
+# melt into a dataframe for plotting 
+bact.rfy.GH_Scomp.genera.ra.ind.mono.df <- psmelt(bact.rfy.GH_Scomp.genera.ra.ind.mono)
+
+# use sampledata.GH_focal
+bact.rfy.GH_Scomp.genera.ra.ind.mono.df$treatment <- factor(bact.rfy.GH_Scomp.genera.ra.ind.mono.df$treatment, levels = c("SL_SL", "BBS_BBS", "JG_JG","S_S"))
+
+GH_mono_colors.cb <- c("darkcyan", "slategray1", "thistle3", "lightgoldenrod")
+X.mono.labels <- c("P.virgatum", "A.gerardii", "K.macrantha", "R.hirta")
+
+## PLOT 
+ggplot(bact.rfy.GH_Scomp.genera.ra.ind.mono.df, aes(y = Abundance, x = treatment, fill = treatment)) + 
+  geom_boxplot(alpha = 1.0) + 
+   geom_point(pch = 21, position = position_jitterdodge()) +
+ scale_fill_manual(values = c(GH_mono_colors.cb)) +
+  scale_x_discrete(labels= X.mono.labels) +
+  labs(x = "Monoculture Treatment", y = "Relative Abundance") + facet_wrap(~Genus, scales = "free_y") +
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 20),
+ axis.text.x = element_text(size = 15, color ="black",face=c("plain","italic","italic","italic","italic")),
+axis.title.y = element_text(size = 20),
+      axis.text.y = element_text(size = 15, color = "black"),
+strip.text.x = element_text(size = 20, face = c("italic","italic","italic","italic","italic")),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 15),
+      legend.title = element_text(size = 15),
+      legend.position="none", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+###################
+### Supplemental Figure 4 STATS 
+
+### one-way anova to compare diff in rel abund among treatments 
+
+# Caulobacter 
+Caulo.trt <- filter(bact.rfy.GH_Scomp.genera.ra.ind.mono.df, Genus == "Caulobacter")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(Caulo.trt$Abundance)
+hist(Caulo.trt$Abundance)
+lm = lm(Abundance ~ treatment, data = Caulo.trt)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+Caulo.trt.anova <- lm(Abundance ~ treatment, data = Caulo.trt)
+plot(Caulo.trt.anova)
+Anova(Caulo.trt.anova, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(Caulo.trt.anova,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,      
+          adjust="fdr")        
+CLD
+
+######
+# Flavobacterium 
+Flavo.trt <- filter(bact.rfy.GH_Scomp.genera.ra.ind.mono.df, Genus == "Flavobacterium")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(Flavo.trt$Abundance)
+hist(Flavo.trt$Abundance)
+lm = lm(Abundance ~ treatment, data = Flavo.trt)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+Flavo.trt.anova <- lm(Abundance ~ treatment, data = Flavo.trt)
+plot(Flavo.trt.anova)
+Anova(Flavo.trt.anova, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(Flavo.trt.anova,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,      
+          adjust="fdr")        
+CLD
+
+
+######
+# Methylophilus 
+Methylophilus.trt <- filter(bact.rfy.GH_Scomp.genera.ra.ind.mono.df, Genus == "Methylophilus")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(Methylophilus.trt$Abundance)
+hist(Methylophilus.trt$Abundance)
+lm = lm(Abundance ~ treatment, data = Methylophilus.trt)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+Methylophilus.trt.anova <- lm(Abundance ~ treatment, data = Methylophilus.trt)
+plot(Methylophilus.trt.anova)
+Anova(Methylophilus.trt.anova, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(Methylophilus.trt.anova,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,      
+          adjust="fdr")        
+CLD
+
+######
+# Methylotenera 
+Methylotenera.trt <- filter(bact.rfy.GH_Scomp.genera.ra.ind.mono.df, Genus == "Methylotenera")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(Methylotenera.trt$Abundance)
+hist(Methylotenera.trt$Abundance)
+lm = lm(Abundance ~ treatment, data = Methylotenera.trt)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+Methylotenera.trt.anova <- lm(Abundance ~ treatment, data = Methylotenera.trt)
+plot(Methylotenera.trt.anova)
+Anova(Methylotenera.trt.anova, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(Methylotenera.trt.anova,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,      
+          adjust="fdr")        
+CLD
+
+
+######
+# Zymomonas  
+Zymomonas.trt <- filter(bact.rfy.GH_Scomp.genera.ra.ind.mono.df, Genus == "Zymomonas")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(Zymomonas.trt$Abundance)
+hist(Zymomonas.trt$Abundance)
+lm = lm(Abundance ~ treatment, data = Zymomonas.trt)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+Zymomonas.trt.anova <- lm(Abundance ~ treatment, data = Zymomonas.trt)
+plot(Zymomonas.trt.anova)
+Anova(Zymomonas.trt.anova, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(Zymomonas.trt.anova,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,      
+          adjust="fdr")        
+CLD
+
+```
+---
+
+# EXUDATES
+*sampledata.GH is the metadata for this (linked by X.SampleID)*
+
+
+## Exudate NPOC
+```{r}
+# for this data I subtracted the average of the three controls total NPOC from the samples. 
+# for some reason we are missing two samples - may not have had enough frozen? (one SL_BBS, one SL_SL)
+
+ExudateNPOC <- read.csv("Metadata/NPOC_NeighID_exudates_RAW.csv ", header = TRUE)
+
+ExudateNPOC.meta <- merge(ExudateNPOC, sampledata.GH, by = "ExudateID" )
+
+#### DOES NPOC differ by treatment? 
+
+# test for normal residuals and equal variances (ANOVA assumptions)
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(ExudateNPOC.meta$NPOC_mg_L)
+hist(ExudateNPOC.meta$NPOC_mg_L)
+lm.ExudateNPOC = lm(NPOC_mg_L ~ treatment, data = ExudateNPOC.meta)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm.ExudateNPOC$residuals 
+shapiro.test(res) 
+
+# 2) homoegeneity of variances
+bartlett.test(NPOC_mg_L ~ treatment , data = ExudateNPOC.meta) 
+
+
+plot(lm.ExudateNPOC)
+Anova(lm.ExudateNPOC, type = "III")
+
+```
+## Supplemental Figure 5 -Summarize & Plot top 10 abundant known metabolites 
+```{r}
+
+Metab_knowns_imputed.top <- sort(colSums(Metab_knowns_imputed), decreasing = TRUE)
+top10metabolites <- names(Metab_knowns_imputed.top[1:10]) # top 10 most abundant 
+print(top10metabolites)
+
+Metab_top10 <- Metab_knowns_imputed[, top10metabolites]
+library(tibble)
+Metab_top10 <- rownames_to_column(Metab_top10, "X.SampleID")
+Metab_top10.trt <- merge(sampledata.GH[,c(1,9)], Metab_top10, by = "X.SampleID")
+
+# make this into long data format 
+library(reshape2)
+Metab_top10.trt2 <- melt(Metab_top10.trt, id.vars=c("X.SampleID", "treatment"))
+library(dplyr)
+Metab_top10.trt2 <- Metab_top10.trt2 %>% rename(Metabolite = variable, Intensity = value)
+
+# create a vector of all metabolites to loop over 
+Metab_top10.trt2$Metabolite<-factor(Metab_top10.trt2$Metabolite, levels=unique(Metab_top10.trt2$Metabolite))
+
+# put treatments in order and set color 
+Metab_top10.trt2$treatment <- factor(Metab_top10.trt2$treatment, levels = c("SL_0", "SL_SL", "SL_BBS", "SL_JG", "SL_S"))
+
+GH_focal_colors.cb <-c("darkseagreen4","darkcyan","slategray1","thistle3","lightgoldenrod")
+
+cex.axis<-8
+cex.title<-10
+cex.pt<-1.3
+cex.strip<-7
+
+X.focal.labels <- c("No neighbor", "P.virgatum","A.gerardii","K.macrantha","R.hirta")
+
+ExudateNames <- c(quinate = "quinate",
+                  malic.acid = "malic acid",
+                  gluconic.acid = "gluconic acid",
+                  hydroxypyruvate = "hydroxypyruvate",
+                  myo.inositol = "myto-inositol",
+                  stearic.acid = "stearic acid", 
+                  fructose = "fructose",
+                  lyxose = "lyxose",
+                  shikimic.acid = "shikimic acid",
+                  azelaic.acid = "azelaic acid" )
+                    
+
+plot_Metabtop10<-ggplot(Metab_top10.trt2, aes(x=treatment, y=Intensity, fill=treatment))+
+  facet_wrap(~Metabolite, ncol=4, scales="free_y", labeller = as_labeller(ExudateNames))+
+  geom_boxplot(alpha=1.0, outlier.shape = NA, width=0.6)+
+  geom_jitter(aes(x=treatment, y=Intensity, fill=treatment), shape=21, size=cex.pt, alpha=0.6, position=position_jitter(width=0.2))+
+    scale_x_discrete(labels= X.focal.labels) +
+  theme_classic()+
+  xlab("")+
+  ylab(expression(paste("Relative Abundance (peak area scaled)")))+
+  theme(axis.title=element_text(size=cex.title, color="black", face="plain"),
+        axis.title.x=element_blank(), 
+        axis.title.y=element_text(size = 12, color = "black"),
+        axis.text.y = element_text(size = 10, color = "black"),
+        axis.text.x = element_text(size = 7, color = "black", face = c("plain","italic","italic","italic","italic")),
+        legend.position = "none",
+        strip.text = element_text(size= 12, colour = "black"))+
+  scale_fill_manual(values=GH_focal_colors.cb)+
+  scale_color_manual(values=GH_focal_colors.cb)
+
+plot_Metabtop10
+
+
+
+```
+### Stats for Supplemental Figure 5 
+```{r}
+#### quinate 
+Quinate.ra <- filter(Metab_top10.trt2, Metabolite == "quinate")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(Quinate.ra$Intensity)
+hist(Quinate.ra$Intensity)
+lm = lm(Intensity ~ treatment, data = Quinate.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+quinate.anova <- lm(Intensity ~ treatment, data = Quinate.ra)
+plot(quinate.anova)
+Anova(quinate.anova, type = "III")
+
+
+#### malicacid 
+malicacid.ra <- filter(Metab_top10.trt2, Metabolite == "malic.acid")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(malicacid.ra$Intensity)
+hist(malicacid.ra$Intensity)
+lm = lm(Intensity ~ treatment, data = malicacid.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+malicacid.anova <- lm(Intensity ~ treatment, data = malicacid.ra)
+plot(malicacid.anova)
+Anova(malicacid.anova, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(malicacid.anova,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,      
+          adjust="fdr")        
+CLD
+
+
+#### gluconic acid  
+gluconicacid.ra <- filter(Metab_top10.trt2, Metabolite == "gluconic.acid")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(gluconicacid.ra$Intensity)
+hist(gluconicacid.ra$Intensity)
+lm = lm(Intensity ~ treatment, data = gluconicacid.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+gluconicacid.anova <- lm(Intensity ~ treatment, data = gluconicacid.ra)
+plot(gluconicacid.anova)
+Anova(gluconicacid.anova, type = "III")
+
+#### myto-inositol 
+myoinositol.ra <- filter(Metab_top10.trt2, Metabolite == "myo.inositol")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(myoinositol.ra$Intensity)
+hist(myoinositol.ra$Intensity)
+lm = lm(Intensity ~ treatment, data = myoinositol.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+myoinositol.anova <- lm(Intensity ~ treatment, data = myoinositol.ra)
+plot(myoinositol.anova)
+Anova(myoinositol.anova, type = "III")
+
+
+
+#### stearic acid  
+stearicacid.ra <- filter(Metab_top10.trt2, Metabolite == "stearic.acid")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(stearicacid.ra$Intensity)
+hist(stearicacid.ra$Intensity)
+lm = lm(Intensity ~ treatment, data = stearicacid.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+stearicacid.anova <- lm(Intensity ~ treatment, data = stearicacid.ra)
+plot(stearicacid.anova)
+Anova(stearicacid.anova, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(stearicacid.anova,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,      
+          adjust="fdr")        
+CLD
+
+
+
+#### fructose  
+fructose.ra <- filter(Metab_top10.trt2, Metabolite == "fructose")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(fructose.ra$Intensity)
+hist(fructose.ra$Intensity)
+lm = lm(Intensity ~ treatment, data = fructose.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+fructose.anova <- lm(Intensity ~ treatment, data = fructose.ra)
+plot(fructose.anova)
+Anova(fructose.anova, type = "III")
+
+
+#### lyxose
+lyxose.ra <- filter(Metab_top10.trt2, Metabolite == "lyxose")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(lyxose.ra$Intensity)
+hist(lyxose.ra$Intensity)
+lm = lm(Intensity ~ treatment, data = lyxose.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+lyxose.anova <- lm(Intensity ~ treatment, data = lyxose.ra)
+plot(lyxose.anova)
+Anova(lyxose.anova, type = "III")
+
+
+
+#### shikimic acid  
+shikimicacid.ra <- filter(Metab_top10.trt2, Metabolite == "shikimic.acid")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(shikimicacid.ra$Intensity)
+hist(shikimicacid.ra$Intensity)
+lm = lm(Intensity ~ treatment, data = shikimicacid.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+shikimicacid.anova <- lm(Intensity ~ treatment, data = shikimicacid.ra)
+plot(shikimicacid.anova)
+Anova(shikimicacid.anova, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(shikimicacid.anova,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,      
+          adjust="fdr")        
+CLD
+
+
+#### azelaic acid  
+azelaicacid.ra <- filter(Metab_top10.trt2, Metabolite == "azelaic.acid")
+
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(azelaicacid.ra$Intensity)
+hist(azelaicacid.ra$Intensity)
+lm = lm(Intensity ~ treatment, data = azelaicacid.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+azelaicacid.anova <- lm(Intensity ~ treatment, data = azelaicacid.ra)
+plot(azelaicacid.anova)
+Anova(azelaicacid.anova, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(azelaicacid.anova,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,      
+          adjust="fdr")        
+CLD
+
+
+
+```
+## Exudate Betadiversity Stats 
+```{r}
+
+
+# Euclidean
+set.seed(2) # this allows you to get the same dissimilarity matrix again and again
+Metab_imp_euc<- vegdist(Metab_imputed, method = "euclidean", binary = FALSE, diag = FALSE, upper = FALSE)
+
+
+# Beta-Dispersion test
+  # permonva adonis test assumes equal variance among the groups, so we need to check this first 
+  # this tests if there is a differences in the spread/dispersial/variability among groups 
+set.seed(2)
+betadisp <- betadisper(Metab_imp_euc,group = Metab_metadata$treatment,type = "centroid")
+permutest(betadisp) 
+
+boxplot(betadisp)
+
+
+# pairwise betadispersion 
+betadisp.TukeyHSD <- TukeyHSD(betadisp, conf.level = 0.95)
+betadisp.TukeyHSD
+
+#############################
+## Permanova 
+set.seed(2)
+exudate.permanova <- adonis2(Metab_imp_euc~Metab_metadata$treatment, permutations = 9999, method = "euclidean", by = "margin")
+exudate.permanova 
+
+
+## Permanova controlling for focal AG biomass
+set.seed(2)
+exudate.permanova.ag <- adonis2(Metab_imp_euc~Metab_metadata$treatment + Metab_metadata$AG_g, permutations = 9999, method = "euclidean", by = "margin")
+exudate.permanova.ag 
+
+
+# Pairwise Adonis 
+library(RVAideMemoire)
+
+vector <- as.vector(Metab_metadata$treatment)
+set.seed(2)
+pairwise.perm.manova(Metab_imp_euc, vector, p.method = "fdr")
+
+
+```
+
+## Supplemental Figure 6 - Heat map Metabolite and abiotic factors 
+```{r}
+
+##### Metabolites 
+
+# Extract top 10 known metabolites 
+Metab_knowns_imputed.top <- sort(colSums(Metab_knowns_imputed), decreasing = TRUE)
+top10metabolites <- names(Metab_knowns_imputed.top[1:10]) # top 10 most abundant 
+Metab_top10 <- Metab_knowns_imputed[, top10metabolites]
+# remove sample that is an outlier for soil moisture 
+Metab_top10.noOut <- filter(Metab_top10, row.names(Metab_top10) != "TMCneighID44") 
+Metab_top10.noOut<- rownames_to_column(Metab_top10.noOut, "X.SampleID")
+
+
+# Discriminant metabolites 
+Metab_knowns_imputed.discrim <- select(Metab_knowns_imputed, "fumaric.acid","malic.acid","saccharic.acid","cytosine", "creatine.phosphate", "X4.pyridoxate", "scyllo.inositol", "X1.methylguanosine", "pinitol", "shikimic.acid", "hypoxanthine", "aldosterone", "jasmonic.acid", "sugars.deoxy.hexoses", "sn.glycerol.3.phosphate", "n.acetyl.l.phenylalanine", "uridine.5.monophosphate", "n.acetyl.l.leucine", "stearic.acid", "X2.hydroxyglutaric.acid", "p.anisaldehyde", "glycerate", "cytidine", "X4.hydroxy.l.phenylglycine", "indole.3.ethanol", "gamma.linolenic.acid", "zeatin", "tryptophan", "asparagine")
+
+Metab_knowns_imputed.discrim.noOut <- filter(Metab_knowns_imputed.discrim, row.names(Metab_knowns_imputed.discrim) != "TMCneighID44") 
+Metab_knowns_imputed.discrim.noOut <- as.matrix(Metab_knowns_imputed.discrim.noOut)
+dim(Metab_knowns_imputed.discrim.noOut)
+
+#####
+# remove the outlier sample for soil moisture
+bact.rfy_GH_focal.noOut <- subset_samples(bact.rfy_GH_focal, X.SampleID != "TMCneighID44") 
+nsamples(bact.rfy_GH_focal.noOut)
+
+# extract sampledata 
+sampledata.focal.noOut <- as.data.frame(as(sample_data(bact.rfy_GH_focal.noOut),"matrix"))
+dim(sampledata.focal.noOut) #24 50 
+
+# subset for only the data we need for correlations 
+sampledata.focal.noOut.sub <- select(sampledata.focal.noOut, "AG_g", "SMC_perc_dryweight","Mean_Root_CN", "Mean_Shoot_CN", "treatment")
+# make columns numeric again 
+  sampledata.focal.noOut.sub$AG_g <- as.numeric(sampledata.focal.noOut.sub$AG_g)
+  sampledata.focal.noOut.sub$Mean_Root_CN <- as.numeric(sampledata.focal.noOut.sub$Mean_Root_CN)
+  sampledata.focal.noOut.sub$SMC_perc_dryweight <- as.numeric(sampledata.focal.noOut.sub$SMC_perc_dryweight)
+ sampledata.focal.noOut.sub$Mean_Shoot_CN <- as.numeric(sampledata.focal.noOut.sub$Mean_Shoot_CN)
+
+# merge metabolite and sampledata
+sampledata.noOut.metab <- merge(sampledata.focal.noOut.sub,Metab_top10.noOut, by.x = 0, by.y = "X.SampleID")
+sampledata.noOut.metab <- column_to_rownames(sampledata.noOut.metab, "Row.names")
+str(sampledata.noOut.metab)
+
+# Remove treatment column
+sampledata.noOut.metab.2 <- select(sampledata.noOut.metab, -treatment)
+
+
+# Pearson correlation between known metabolites and abiotic variabiles 
+library(Hmisc)
+cormat <- rcorr(as.matrix(sampledata.noOut.metab.2), type = "pearson")
+
+# function to extract all r & p values 
+flattenCorrMatrix <- function(cormat, pmat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut],
+    p = pmat[ut]
+    )
+}
+
+cormat.results <- flattenCorrMatrix(cormat$r, cormat$P)
+
+# subset for just the significant and strong correlations 
+cormat.results.sig <- filter(cormat.results, cor > 0.5 | cor < 0.5 & p < 0.05)
+
+library(reshape2)
+cormat.results.sig.mat <- dcast(cormat.results.sig, row ~ column, value.var = "cor")
+
+# reorder rows 
+cormat.results.sig.mat <- cormat.results.sig.mat %>%
+  mutate(row =  factor(row, levels = c("AG_g","SMC_perc_dryweight","Mean_Shoot_CN","Mean_Root_CN","malic.acid","stearic.acid","quinate","myo.inositol","hydroxypyruvate","gluconic.acid"))) %>%
+  arrange(row) 
+
+rownames(cormat.results.sig.mat) <- cormat.results.sig.mat$row
+cormat.results.sig.mat <- select(cormat.results.sig.mat, - row)
+
+
+#### PLOT HEATMAP 
+
+#https://rlbarter.github.io/superheat/
+#devtools::install_github("rlbarter/superheat")
+library(superheat)
+superheat(cormat.results.sig.mat,
+          heat.na.col = "white",    # make NAs white 
+                    left.label.size = 0.3,
+                    left.label.text.size = 6,
+                    left.label.col = "white",
+                    left.label.text.col = "black",
+                    left.label.text.alignment = "right",
+                    bottom.label.size = .5,
+                    bottom.label.text.size = 6,
+                    bottom.label.text.angle = 90,
+                    bottom.label.col = "white",
+                    bottom.label.text.alignment = "right")
+
+
+### Plot individual metabolite interactions with abiotic factors 
+Metab_top10.noOut.m <- melt(Metab_top10.noOut)
+
+# merge with sample data 
+Metab_top10.noOut.m.samp <- merge(Metab_top10.noOut.m, sampledata.GH_focal, by = "X.SampleID")
+
+
+### Malic acid - Figure Supplemental 6B
+
+Metab_top10.noOut.m.samp.MA <- filter(Metab_top10.noOut.m.samp, variable == "malic.acid")
+
+Metab_top10.noOut.m.samp.MA$treatment <- factor(Metab_top10.noOut.m.samp.MA$treatment, levels = c("SL_0", "SL_SL", "SL_BBS", "SL_JG", "SL_S"))
+GH_focal_colors.cb <- c("darkseagreen4","darkcyan","slategray1","thistle3","lightgoldenrod")
+X.focal.labels <- c("No Neighbor", "P.virgatum", "A.gerardii", "K.macrantha", "R.hirta")
+
+
+MA_RootCN <- ggplot(Metab_top10.noOut.m.samp.MA, aes(x=Mean_Root_CN, y=as.numeric(value), color = treatment)) +
+  geom_point(size=5) + 
+  scale_color_manual(values = c(GH_focal_colors.cb)) +
+  labs(x = "Mean Root C:N", y = "Malic Acid Intensity") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 15),
+ axis.text.x = element_text(size = 15),
+axis.title.y = element_text(size = 15),
+      axis.text.y = element_text(size = 15, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 15),
+      legend.title = element_text(size = 15),
+      legend.position="right", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+
+MA_ShootCN <- ggplot(Metab_top10.noOut.m.samp.MA, aes(x=Mean_Shoot_CN, y=as.numeric(value), color = treatment)) +
+  geom_point(size=5) + 
+  scale_color_manual(values = c(GH_focal_colors.cb)) +
+  labs(x = "Mean Shoot C:N", y = "Malic Acid Intensity") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 15),
+ axis.text.x = element_text(size = 15),
+axis.title.y = element_text(size = 15),
+      axis.text.y = element_text(size = 15, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 15),
+      legend.title = element_text(size = 15),
+      legend.position="right", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+MA_SMC <- ggplot(Metab_top10.noOut.m.samp.MA, aes(x=SMC_perc_dryweight, y=as.numeric(value), color = treatment)) +
+  geom_point(size=5) + 
+  scale_color_manual(values = c(GH_focal_colors.cb)) +
+  labs(x = "Soil Moisture Content", y = "Malic Acid Intensity") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 15),
+ axis.text.x = element_text(size = 15),
+axis.title.y = element_text(size = 15),
+      axis.text.y = element_text(size = 15, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 15),
+      legend.title = element_text(size = 15),
+      legend.position="right", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+MA_AGbiomass <- ggplot(Metab_top10.noOut.m.samp.MA, aes(x=AG_g, y=as.numeric(value), color = treatment)) +
+  geom_point(size=5) + 
+  scale_color_manual(values = c(GH_focal_colors.cb)) +
+  labs(x = "Focal Aboveground Biomass (g)", y = "Malic Acid Intensity") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 15),
+ axis.text.x = element_text(size = 15),
+axis.title.y = element_text(size = 15),
+      axis.text.y = element_text(size = 15, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 15),
+      legend.title = element_text(size = 15),
+      legend.position="right", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+#### Arrange all these plots together 
+library('ggpubr')
+
+ ggarrange(MA_AGbiomass, MA_SMC, MA_RootCN, MA_ShootCN,
+                    labels = c("B","C","D","E"),
+                    ncol = 2, nrow = 2, 
+                   heights = c(1,1,1,1), widths = c(1,1,1,1),
+                    common.legend = TRUE, legend = "none",
+            align = "v")
+ 
+
+
+```
+
+### Figure 3: Known Metabs PLS-DA - Mixomics 
+https://mixomicsteam.github.io/Bookdown/plsda.html
+http://mixomics.org/methods/pls-da/
+```{r}
+# note: the figure was modified in powerpoint for publication 
+
+ # add cluster within each sample type with splsda
+  #sparse PLS-DA (sPLS-DA) enables the selection of the most predictive or discriminative features in the data that help classify the samples (Lê Cao et al., 2011).
+
+Metab_knowns_imputed <- Metab_knowns_imputed[ order(rownames(Metab_knowns_imputed)) , ]
+sampledata.GH_focal <- sampledata.GH_focal[order(rownames(sampledata.GH_focal)),]
+treatment <- sampledata.GH_focal$treatment
+
+#We use the function tune.splsda to select the parameters including the number of components, ncomp, and the number of variables to choose in the X data set, keepX.
+
+# grid of possible keepX values that will be tested for each comp 
+list.keepX <- c(seq(10, 50, 10))
+set.seed(2543) # for reproducibility here,
+# to speed up the computational time, consider the cpu argument
+# take ~ 4 min to run
+tune.splsda <- tune.splsda(Metab_knowns_imputed, treatment, ncomp = 4, validation = 'Mfold', folds = 5, 
+                           progressBar = TRUE, dist = 'max.dist',
+                           test.keepX = list.keepX, nrepeat = 100) #nrepeat 50-100 for better estimate
+
+tune.splsda$choice.keepX # optimal # features to select
+
+
+
+tune.splsda$choice.ncomp$ncomp # optimal # of components = 4
+  
+plot(tune.splsda, col = color.jet(4)) # visualize error rate by # of components
+
+########
+ # Run the actual model 
+## PLS-DA function (http://mixomics.org/methods/pls-da/)
+choice.ncomp <- tune.splsda$choice.ncomp$ncomp
+choice.keepX <- tune.splsda$choice.keepX[1:choice.ncomp]
+splsda.res <- splsda(Metab_knowns_imputed, treatment, ncomp = choice.ncomp, keepX = choice.keepX) 
+
+metab.knowns.splsda <- splsda(Metab_knowns_imputed, treatment, ncomp = choice.ncomp, keepX = choice.keepX) 
+
+
+#check the performance of the final splsda model 
+perf.splsda <- perf(metab.knowns.splsda, validation = "loo", progressbar = TRUE) 
+
+perf.splsda$error.rate
+perf.splsda$error.rate.class #error rate by treatment 
+
+plot(perf.splsda, col = color.mixo(5:7), sd = TRUE, legend.position = "vertical") # plot your error rate 
+
+
+#The final selection of features can be output, along with their weight coefficient (most important based on their aboslute value) using the selectVar function:
+selectVar(metab.knowns.splsda, comp=1)$name     
+
+# Variable selection output 
+
+Known.selectvar <- as.data.frame(selectVar(metab.knowns.splsda, comp=1)$value)
+ 
+#Visualize selected variables with the arguments contrib = 'max' that is going to assign to each variable bar the sample group colour for which the mean (method = 'mean') is maximum. See example(plotLoadings) for other options (e.g. min, median)
+
+################### PLOT selected variables 
+
+
+# order of splsda 
+SL_0color <- "darkseagreen4"
+SL_SLcolor <- "darkcyan"
+SL_BBScolor <- "slategray1"
+SL_JGcolor <- "thistle3"
+SL_Scolor <- "lightgoldenrod"
+
+# order of plots for splsda loadings 
+metab.knowns.splsda$Y
+Loadingcolors <- c(SL_0color,SL_BBScolor,SL_JGcolor, SL_Scolor, SL_SLcolor)
+
+# Figure 3B
+ plotLoadings(metab.knowns.splsda, contrib = 'max', method = 'mean', comp = 1, ndisplay = 15, legend.color = Loadingcolors, legend = FALSE, border = TRUE, title = "Known Metabolites PC1")
+
+ # Figure 3C
+ plotLoadings(metab.knowns.splsda, contrib = 'max', method = 'mean', comp = 2, ndisplay = 15, legend.color = Loadingcolors, legend = FALSE, border = TRUE, title = "Known Metabolites PC2")
+ 
+plotLoadings(metab.knowns.splsda, contrib = 'max', method = 'mean', comp = 3, ndisplay = 15, legend.color = Loadingcolors, legend = FALSE, border = TRUE, title = "Known Metabolites PC3")
+
+
+# Figure 3A 
+plotIndiv(metab.knowns.splsda, style="ggplot2", col = Loadingcolors, ind.names = FALSE,
+          pch = 16, # point shape
+          cex = 8, # point size
+          size.axis = 20,
+          X.Label = "PCA 1, 15%",
+          Y.Label = "PCA 2, 14%")
+
+
+#A Clustered Image Map including the final gene signature is plotted (default values to Euclidian distance and Complete linkage). The argument comp can be also be specified to highlight only the variables selected on specific components.
+cim(metab.knowns.splsda, comp=1, title ="Component 1")
+
+
+    ```
+---
+# LINK BACTERIA & EXUDATES 
+
+## Figure 4A: Focal Bacteria - Variance Partitioning 
+```{r}
+
+# remove sample that is an outlier for soil moisture 
+bact.rfy_GH_focal.noOut <- subset_samples(bact.rfy_GH_focal, X.SampleID != "TMCneighID44") 
+nsamples(bact.rfy_GH_focal.noOut)
+
+set.seed(2)
+bact.rfy_GH_focal_wuni <- phyloseq::distance(bact.rfy_GH_focal.noOut, "wunifrac" )
+
+
+# Distance matrix - should be as matrix 
+bact.rfy_GH_focal_wuni.m <- as.dist(bact.rfy_GH_focal_wuni)
+
+# extract sampledata 
+sampledata.focal.noOut <- as.data.frame(as(sample_data(bact.rfy_GH_focal.noOut),"matrix"))
+dim(sampledata.focal.noOut) #24 50 
+
+##### Metabolites 
+
+# Extract top 10 known metabolites 
+Metab_knowns_imputed.top <- sort(colSums(Metab_knowns_imputed), decreasing = TRUE)
+top10metabolites <- names(Metab_knowns_imputed.top[1:10]) # top 10 most abundant 
+Metab_top10 <- Metab_knowns_imputed.log[, top10metabolites]
+# remove sample that is an outlier for soil moisture 
+Metab_top10.noOut <- filter(Metab_top10, row.names(Metab_top10) != "TMCneighID44") 
+Metab_top10.noOut <- as.matrix(Metab_top10.noOut)
+
+
+##########################
+### Variance Partitioning  
+sampledata.focal.noOut.sub <- select(sampledata.focal.noOut, "AG_g", "SMC_perc_dryweight","Mean_Root_CN", "Mean_Shoot_CN", "treatment")
+# make columns numeric again 
+  sampledata.focal.noOut.sub$AG_g <- as.numeric(sampledata.focal.noOut.sub$AG_g)
+  sampledata.focal.noOut.sub$Mean_Root_CN <- as.numeric(sampledata.focal.noOut.sub$Mean_Root_CN)
+  sampledata.focal.noOut.sub$SMC_perc_dryweight <- as.numeric(sampledata.focal.noOut.sub$SMC_perc_dryweight)
+ sampledata.focal.noOut.sub$Mean_Shoot_CN <- as.numeric(sampledata.focal.noOut.sub$Mean_Shoot_CN)
+
+# order by rownames so that you can match otu file 
+Metab_top10.noOut <- Metab_top10.noOut[ order(rownames(Metab_top10.noOut)) , ]
+
+
+sampledata.focal.noOut.sub <- sampledata.focal.noOut.sub[ order(rownames(sampledata.focal.noOut.sub)) , ]
+
+
+# check that the subjects are matched in the 2 datasets 
+# also check sampledata order because we'll use this for metadata in plotting
+head(cbind(rownames(sampledata.focal.noOut), rownames(sampledata.focal.noOut.sub)))
+
+
+set.seed(2)
+mod.topmetab <- varpart(bact.rfy_GH_focal_wuni.m,~Metab_top10.noOut, ~Mean_Shoot_CN, ~treatment , data = sampledata.focal.noOut.sub)
+
+mod.topmetab
+
+showvarparts(3)
+plot(mod.topmetab, bg=2:5)#bg changes colors of vendiagram            
+
+
+
+
+```
+## Figure 4B - Focal dbRDA (wuni) 
+
+```{r}
+#http://finzi.psych.upenn.edu/R/library/vegan/html/capscale.html
+#https://www.rpubs.com/roalle/mres_2019
+#Distance-Based Redundancy Analysis (dbRDA; Legendre and Anderson, 1999) is an extension of Redundancy Analysis (RDA) which allows the use of non-euclidean distance matrices as inputs (e.g. Bray-Curtis dissimilarity). The method works by first calculating a PCoA from the dissimilarity matrix, and then subjecting the PCoA eigenvalues (which represent dissimilarities in euclidean space) to RDA. The method aims to detect linear relationships between environmental variables and these dissimilarities.
+#dbRDA differs from PCoA in that it is a constrained analysis. While PCoA axes are generated to explain maximum variation in the distance matrix, dbRDA canonical axes are constructed as linear combinations of environmental variables. Consequently these axes are constrained to the environmental variables in the model, and the ordination will be distinct from the PCoA. dbRDA allows us to visualise how environmental variables contrain variation in community composition between our sites.
+#As dbRDA considers multiple environmental variables which are measured using different techniques, it is important to normalise environmental variables such that they can be compared concurrently. This is achieved using a z-score transformation. Moreover, dbRDA is sensitive to multicolinearity (i.e. high correlation between environmental variables). We can test whether any of our environmental variables are correlated by calculating variance inflation factors (VIFs) and then removing selected terms from the model until all VIF scores are < 10.
+
+# remove sample that is an outlier for soil moisture 
+bact.rfy_GH_focal.noOut <- subset_samples(bact.rfy_GH_focal, X.SampleID != "TMCneighID44") 
+nsamples(bact.rfy_GH_focal.noOut)
+
+
+set.seed(2)
+bact.rfy_GH_focal_wuni <- phyloseq::distance(bact.rfy_GH_focal.noOut, "wunifrac" )
+
+
+# Distance matrix - should be as matrix for dbrda
+bact.rfy_GH_focal_wuni.m <- as.matrix(bact.rfy_GH_focal_wuni)
+
+# add metabolites to sampledata 
+# find most abundant known metabolites 
+Metab_knowns_imputed.top <- sort(colSums(Metab_knowns_imputed), decreasing = TRUE)
+top10metabolites <- names(Metab_knowns_imputed.top[1:10]) # top 10 most abundant 
+
+                      
+# add top 10 metabolites to sampledata for phyloseq object 
+Metab_top10 <- Metab_knowns_imputed[, top10metabolites]
+dim(Metab_top10)
+rownames(Metab_top10)
+sampledata.GH_focal_metab <- merge(Metab_top10, sample_data(bact.rfy_GH_focal.noOut), by = 0)
+sampledata.GH_focal_metab <- column_to_rownames(sampledata.GH_focal_metab, "Row.names")
+sampledata.GH_focal_metab <- select(sampledata.GH_focal_metab, "quinate", "malic.acid","gluconic.acid","hydroxypyruvate","myo.inositol",          "stearic.acid","fructose","lyxose", "shikimic.acid","azelaic.acid", "AG_g", "SMC_perc_dryweight","Mean_Shoot_CN","Mean_Root_CN")
+
+
+# scale all variables by z score (#/mean of variable/sd variable)
+#https://www.r-bloggers.com/r-tutorial-series-centering-variables-and-generating-z-scores-with-the-scale-function/
+
+sampledata.GH_focal_metab_Zscale <- scale(sampledata.GH_focal_metab, center = TRUE, scale = TRUE)
+row.names(sampledata.GH_focal_metab_Zscale) # confirm that sampledata and distance matrix are in the same order 
+sampledata.GH_focal_metab_Zscale <- as.data.frame(sampledata.GH_focal_metab_Zscale)
+
+####
+# see which variables explain the most information 
+
+set.seed(2) # Z-score scaled variables have .x after them after merging
+dbRDA0 <- dbrda(bact.rfy_GH_focal_wuni.m ~ 1, data = sampledata.GH_focal_metab_Zscale) # model with intercept only
+set.seed(2)
+dbRDA.all <- dbrda(bact.rfy_GH_focal_wuni.m ~ ., data = sampledata.GH_focal_metab_Zscale) # model with all variables 
+
+# check for collinearity 
+vif.cca(dbRDA.all) # a VIF > 20 is strong collinearity, >10 should be concerning 
+
+## Which variables should be included (improve model fit)?
+set.seed(2)
+step.res <- ordistep(dbRDA0, scope =  formula(dbRDA.all), permutations = 999, direction = "forward")
+
+# evaluate the statistical significance of the constraint
+anova(step.res)
+step.res$anova # shows what are the strongest predictors 
+
+##################
+set.seed(2)
+dbRDA.sub <- dbrda(bact.rfy_GH_focal_wuni.m ~  malic.acid +stearic.acid + Mean_Shoot_CN, data = sampledata.GH_focal_metab_Zscale) # model with all variables 
+
+summary(dbRDA.sub)
+
+
+plot(dbRDA.sub)
+
+anova(dbRDA.sub) # overall significance 
+                              
+           
+anova(dbRDA.sub, by = "axis", perm.max = 500)
+
+set.seed(2) # margin makes it so that the order of the samples in the model doesn't matter 
+x <- anova(dbRDA.sub, by="terms", permu=999, mods = "margin") # signifcance by terms 
+x
+
+# Calculate R2 
+x$R2 <- (x$SumOfSqs/sum(x$SumOfSqs))*100
+View(x)
+
+
+
+#############################
+# PLOT 
+
+
+
+smry <- summary(dbRDA.sub)
+scrs <- scores(dbRDA.sub)
+df1  <- data.frame(smry$sites[,1:2]) # site scores for RDA1 and RDA2
+df1$X.SampleID <- rownames(df1)  #add site names
+df1 <- merge(sampledata.GH_focal, df1, by = "X.SampleID") # add sampledata and treatment to df1 
+
+# set colors by order 
+df1$treatment <- factor(df1$treatment, levels =  c("SL_0", "SL_SL","SL_BBS","SL_JG","SL_S" )) # put in order 
+bact.GH_focal_colors.cb <- c("darkseagreen4","darkcyan","slategray1","thistle3","lightgoldenrod") 
+
+# define labels
+arrow.label <- c("Malic Acid *", "Stearic Acid +", "Shoot CN #")
+arrow.label.none <- c("", "", "")# abbreviated labels that I fixed in powerpoint
+
+X.focal.labels <- c("No Neighbor", "P.virgatum", "A.gerardii", "K.macrantha", "R.hirta")
+
+
+
+df2  <- data.frame(smry$biplot[,1:2]) # mapping environmental variables
+
+rda.plot <- ggplot(df1, aes(x=dbRDA1, y=dbRDA2, colour = treatment)) + 
+ # this is arrow features
+  geom_segment(data=df2, aes(x=0, xend=dbRDA1, y=0, yend=dbRDA2), 
+               color="darkgray", arrow=arrow(length=unit(0.01,"npc"),type = "closed"),size = 2) +
+  # arrow labels 
+  geom_text(data=df2, aes(x=dbRDA1,y=dbRDA2,label=arrow.label.none,
+            hjust=0.5*(1-sign(dbRDA1)),vjust=0.5*(1-sign(dbRDA2))), 
+            color="black", size = 3.5) +
+  # Points 
+  geom_point(size = 10 ) +
+  scale_colour_manual("Neighbor Treatment", values = bact.GH_focal_colors.cb, labels = X.focal.labels) +
+  
+   geom_hline(yintercept=0, linetype="dotted") +
+  geom_vline(xintercept=0, linetype="dotted") +
+  xlim(-1.05, 1.65) +
+  ylim(-1.5, 1.05) +
+  xlab("RDA1 (9.2%)") + # this percentage comes from the CAP1 'importance of components:' proportion explained, which can be found in summary(dbRDA.full) 
+  ylab("RDA2 (5.9%)") + # this percentage comes from the CAP2 'importance of components:' proportion explained, which can be found in summary(dbRDA.full) 
+  coord_fixed() +
+  theme(plot.margin=unit(c(.5,1,.5,.5),"cm"),
+    axis.text = element_text(size = 20),
+        axis.title.x = element_text(size = 20, color = "black"),
+        axis.title.y = element_text(size = 20, color = "black"),
+        axis.text.x = element_text(size = 20, color = "black"), 
+        axis.text.y = element_text(size = 20, color = "black"), 
+    legend.position="none", 
+      panel.border = element_rect(colour = "black", fill=NA, size=2),
+)
+rda.plot
+
+##############################################################
+## PCA Metabolites ALL 
+
+## Use the scaled/compositional dataset with imputed NAs
+
+# Should the data be transformed with center log ratio to meet normality?
+library(compositions)
+Metab_imputed1 <- Metab_imputed + 1 # add a constant so we don't get zeros
+Metab_imputed.clr <- as.data.frame(clr(Metab_imputed1))
+
+set.seed(2)
+Metab_pca <- prcomp(Metab_imputed, scale = TRUE)
+fviz_eig(Metab_pca) # visualize Eigenvectors (what dimensions explain what % of variance)
+summary(Metab_pca) # gives values for % of variance explained 
+
+
+data.scores <- as.data.frame(Metab_pca$x) # extract the coordinate scores from metadMDS 
+data.scores <- rownames_to_column(data.scores, "X.SampleID") # add the sampleIDs 
+
+# merge other metadata with this file 
+PCA_meta <- merge(data.scores, Metab_metadata, by = "X.SampleID")
+dim(PCA_meta) #25 75
+
+# reorder treatments
+PCA_meta$treatment <- factor(PCA_meta$treatment, levels = c("SL_0", "SL_SL", "SL_BBS", "SL_JG", "SL_S"))
+GH_focal_colors.cb <- c("#009E73", "#E69F00", "#56B4E9", "#0072B2", "#F0E442")
+
+
+
+# plot PCA (x and y should be your NMDS coords)
+MetabPCA <- ggplot(data=PCA_meta,aes(x=PC1,y=PC2,color=treatment))+
+    geom_point(size = 10, alpha = 0.5, shape = 17) + 
+ scale_colour_manual("Neighbor Treatment", values = GH_focal_colors.cb, labels = X.focal.labels) +
+    labs(y = "PC2, 28% ", x = "PC1, 17%") + # pulled these values from summary 
+  theme(axis.title.x = element_text(size = 20), 
+  axis.title.y = element_text(size = 20), 
+  axis.text.x = element_text(size = 20, color = "black"), 
+  axis.text.y = element_text(size = 20, color = "black"), 
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 20), 
+  legend.position="none", #remove legend  
+plot.margin=unit(c(.5,1,.5,.5),"cm"))  # add margins
+  
+  
+
+
+
+#### Arrange all these plots together 
+library('ggpubr')
+
+ ggarrange( MetabPCA,rda.plot,
+                    labels = c("A", "B"),
+                    ncol = 2, nrow = 1, 
+                   heights = 1, widths = 2,
+                    common.legend = TRUE, legend = "right",
+            align = "hv")
+ 
+
+
+```
+
+### Dominant taxa dbRDA (supplemental table 4)
+```{r}
+#http://finzi.psych.upenn.edu/R/library/vegan/html/capscale.html
+
+
+# remove sample that is an outlier for soil moisture 
+bact.rfy_GH_focal.noOut <- subset_samples(bact.rfy_GH_focal, X.SampleID != "TMCneighID44") 
+nsamples(bact.rfy_GH_focal.noOut)
+
+
+
+# Dominant taxa = top 10% 
+ntaxa(bact.rfy_GH_focal.noOut) # 5713 (so top 10% is 571 taxa)
+top10 = names(sort(taxa_sums(bact.rfy_GH_focal.noOut), TRUE)[1:571])
+bact.rfy_GH_focal.top10 = prune_taxa(top10, bact.rfy_GH_focal.noOut)
+ntaxa(bact.rfy_GH_focal.top10) # 571
+
+set.seed(2)
+bact.rfy_GH_focal_wuni.top10 <- phyloseq::distance(bact.rfy_GH_focal.top10, "wunifrac" )
+
+
+# Distance matrix - should be as matrix for dbrda
+bact.rfy_GH_focal_wuni.top10.m <- as.matrix(bact.rfy_GH_focal_wuni.top10)
+
+# add metabolites to sampledata 
+# find most abundant known metabolites 
+Metab_knowns_imputed.top <- sort(colSums(Metab_knowns_imputed), decreasing = TRUE)
+top10metabolites <- names(Metab_knowns_imputed.top[1:10]) # top 10 most abundant 
+
+                   
+# add top 10 metabolites to sampledata for phyloseq object 
+Metab_top10 <- Metab_knowns_imputed[, top10metabolites]
+dim(Metab_top10)
+rownames(Metab_top10)
+sampledata.GH_focal_metab <- merge(Metab_top10, sample_data(bact.rfy_GH_focal.top10), by = 0)
+sampledata.GH_focal_metab <- column_to_rownames(sampledata.GH_focal_metab, "Row.names")
+
+
+sampledata.GH_focal_metab2 <-  select(sampledata.GH_focal_metab, "quinate", "malic.acid","gluconic.acid","hydroxypyruvate","myo.inositol",          "stearic.acid","fructose","lyxose", "shikimic.acid","azelaic.acid", "AG_g", "NO3_ppm", "SMC_perc_dryweight","Mean_Shoot_CN","Mean_Root_CN")
+
+
+
+
+# scale all variables by z score (#/mean of variable/sd variable)
+#https://www.r-bloggers.com/r-tutorial-series-centering-variables-and-generating-z-scores-with-the-scale-function/
+
+sampledata.GH_focal_metab2_Zscale <- scale(sampledata.GH_focal_metab2, center = TRUE, scale = TRUE)
+row.names(sampledata.GH_focal_metab2_Zscale) # confirm that sampledata and distance matrix are in the same order 
+sampledata.GH_focal_metab2_Zscale <- as.data.frame(sampledata.GH_focal_metab2_Zscale)
+dim(sampledata.GH_focal_metab2_Zscale)
+
+####
+# see which variables explain the most information 
+
+set.seed(2) # Z-score scaled variables have .x after them after merging
+top10.dbRDA0 <- dbrda(bact.rfy_GH_focal_wuni.top10 ~ 1, data = sampledata.GH_focal_metab2_Zscale) # model with intercept only
+set.seed(2)
+top10.dbRDA.all <- dbrda(bact.rfy_GH_focal_wuni.top10 ~ ., data = sampledata.GH_focal_metab2_Zscale) # model with all variables 
+
+## Which variables should be included (improve model fit)?
+set.seed(2)
+top10.step.res <- ordistep (top10.dbRDA0, scope =  formula(top10.dbRDA.all), permutations = 999, direction = "forward")
+
+# evaluate the statistical significance of the constraint
+anova(top10.step.res)
+top10.step.res$anova # shows what are the strongest predictors 
+# malic acid & mean_shoot_CN
+
+##################
+set.seed(2)
+top10.dbRDA.sub <- dbrda(bact.rfy_GH_focal_wuni.top10 ~ malic.acid + stearic.acid +  Mean_Shoot_CN, data = sampledata.GH_focal_metab2_Zscale) # model with all variables 
+
+summary(top10.dbRDA.sub)
+
+plot(top10.dbRDA.sub)
+
+anova(top10.dbRDA.sub) # overall significance 
+                              
+           
+anova(top10.dbRDA.sub, by = "axis", perm.max = 500)
+
+set.seed(2)
+top10.x <- anova(top10.dbRDA.sub, by="terms", permu=999, mods = "margin") # signifcance by terms 
+top10.x
+# Calculate R2 
+top10.x$R2 <- (top10.x$SumOfSqs/sum(top10.x$SumOfSqs))*100
+View(top10.x)
+
+```
+### Non-dominant taxa dbRDA (supplemental table 4)
+```{r}
+#http://finzi.psych.upenn.edu/R/library/vegan/html/capscale.html
+
+# rest of taxa
+remainingtaxa = names(sort(taxa_sums(bact.rfy_GH_focal), TRUE)[572:5713])
+bact.rfy_GH_focal.remain = prune_taxa(remainingtaxa, bact.rfy_GH_focal)
+ntaxa(bact.rfy_GH_focal.remain) # 5142
+sum(sample_sums(bact.rfy_GH_focal.remain))/sum(sample_sums(bact.rfy_GH_focal))
+# 30% of reads 
+
+
+# remove sample that is an outlier for soil moisture 
+bact.rfy_GH_focal.remain.noOut <- subset_samples(bact.rfy_GH_focal.remain, X.SampleID != "TMCneighID44") 
+nsamples(bact.rfy_GH_focal.remain.noOut)
+
+
+
+set.seed(2)
+bact.rfy_GH_focal_wuni.lower90 <- phyloseq::distance(bact.rfy_GH_focal.remain.noOut, "wunifrac" )
+
+
+# Distance matrix - should be as matrix for dbrda
+bact.rfy_GH_focal_wuni.lower90.m <- as.matrix(bact.rfy_GH_focal_wuni.lower90)
+
+# add metabolites to sampledata 
+# find most abundant known metabolites 
+Metab_knowns_imputed.top <- sort(colSums(Metab_knowns_imputed), decreasing = TRUE)
+top10metabolites <- names(Metab_knowns_imputed.top[1:10]) # top 10 most abundant 
+
+                   
+# add top 10 metabolites to sampledata for phyloseq object 
+Metab_top10 <- Metab_knowns_imputed[, top10metabolites]
+dim(Metab_top10)
+rownames(Metab_top10)
+sampledata.GH_focal_metab <- merge(Metab_top10, sample_data(bact.rfy_GH_focal.remain.noOut), by = 0)
+sampledata.GH_focal_metab <- column_to_rownames(sampledata.GH_focal_metab, "Row.names")
+
+
+sampledata.GH_focal_metab2 <-  select(sampledata.GH_focal_metab, "quinate", "malic.acid","gluconic.acid","hydroxypyruvate","myo.inositol",          "stearic.acid","fructose","lyxose", "shikimic.acid","azelaic.acid", "AG_g", "NO3_ppm", "SMC_perc_dryweight","Mean_Shoot_CN","Mean_Root_CN")
+
+dim(sampledata.GH_focal_metab2)
+
+
+# scale all variables by z score (#/mean of variable/sd variable)
+#https://www.r-bloggers.com/r-tutorial-series-centering-variables-and-generating-z-scores-with-the-scale-function/
+
+sampledata.GH_focal_metab2_Zscale <- scale(sampledata.GH_focal_metab2, center = TRUE, scale = TRUE)
+row.names(sampledata.GH_focal_metab2_Zscale) # confirm that sampledata and distance matrix are in the same order 
+sampledata.GH_focal_metab2_Zscale <- as.data.frame(sampledata.GH_focal_metab2_Zscale)
+dim(sampledata.GH_focal_metab2_Zscale)
+
+####
+# see which variables explain the most information 
+
+set.seed(2) # Z-score scaled variables have .x after them after merging
+lower90.dbRDA0 <- dbrda(bact.rfy_GH_focal_wuni.lower90 ~ 1, data = sampledata.GH_focal_metab2_Zscale) # model with intercept only
+set.seed(2)
+lower90.dbRDA.all <- dbrda(bact.rfy_GH_focal_wuni.lower90 ~ ., data = sampledata.GH_focal_metab2_Zscale) # model with all variables 
+
+## Which variables should be included (improve model fit)?
+set.seed(2)
+lower90.step.res <- ordistep (lower90.dbRDA0, scope =  formula(lower90.dbRDA.all), permutations = 999, direction = "forward")
+
+# evaluate the statistical significance of the constraint
+anova(lower90.step.res)
+lower90.step.res$anova # shows what are the strongest predictors 
+
+##################
+set.seed(2)
+lower90.dbRDA.sub <- dbrda(bact.rfy_GH_focal_wuni.lower90 ~ malic.acid + stearic.acid +  Mean_Shoot_CN, data = sampledata.GH_focal_metab2_Zscale) # model with all variables 
+
+summary(lower90.dbRDA.sub)
+
+plot(lower90.dbRDA.sub)
+
+anova(lower90.dbRDA.sub) # overall significance 
+                              
+           
+anova(lower90.dbRDA.sub, by = "axis", perm.max = 500)
+
+set.seed(2)
+lower90.x <- anova(lower90.dbRDA.sub, by="terms", permu=999, mods = "margin") # signifcance by terms 
+lower90.x
+# Calculate R2 
+lower90.x$R2 <- (lower90.x$SumOfSqs/sum(lower90.x$SumOfSqs))*100
+View(lower90.x)
+
+```
+
+## Protest Analysis with PCA axes 
+```{r}
+#https://john-quensen.com/tutorials/procrustes-analysis/
+
+# first put rownames in order so that bact and metab sample order match
+Metab_imputed2 <- Metab_imputed[ order(rownames(Metab_imputed)) , ]
+rownames(Metab_imputed2)
+
+# extract otu table
+bact.rfy_GH_focal.otu <- t(as.data.frame(as(otu_table(bact.rfy_GH_focal),"matrix")))
+
+# first put rownames in order so that bact and metab sample order match
+bact.rfy_GH_focal.otu <- bact.rfy_GH_focal.otu[ order(rownames(bact.rfy_GH_focal.otu)) , ]
+rownames(bact.rfy_GH_focal.otu)
+
+# these should be the same order for samplenames
+row.names(Metab_imputed2)
+
+# PCA of metabolite data - scaled so means = 0 and sd = 1 
+metab.std = decostand(Metab_imputed2, method = "standardize")
+pca.metab <- rda(metab.std)
+plot(pca.metab, scaling = 1, display = "sites", type = "point", 
+     main = "PCA for Metabolite Data")
+
+# PCA for bacteria - hellinger transformed so that it is appropriate for PCA (euclidean distances)
+otu.hel <- decostand(bact.rfy_GH_focal.otu, method = "hellinger")
+pca.otu <- rda(otu.hel)
+
+plot(pca.otu, scaling = 1, display = "sites", type = "point", 
+     main = "PCA for OTU Data")
+
+
+
+
+# Procrustes -  the second ordination is rotated and usually re-scaled to minimize the sum of squared differences between the two ordinations. This makes the ordinations appear more similar. Think rotating and stretching, or shrinking, (but no chopping of legs!).It makes more sense to put the PCA for the environmental data first because the species data is being fit to the environmental data. If symmetric = TRUE, the order does not matter. 
+
+pro <- procrustes(X = pca.metab, Y = pca.otu, symmetric = TRUE)
+pro
+
+plot(pro, kind = 1, type = "point") # plot of similarity between samples 
+plot(pro, kind = 2,) # plot of which samples are the best vs. worst fit. 
+
+
+set.seed(2)
+protest(X = pca.metab , Y = pca.otu , scores = "sites", permutations = 9999)
+
+
+###############################################
+### DO THIS FOR DOMINANT AND NON-DOMINANT TAXA 
+
+
+# Dominant taxa = top 10% 
+ntaxa(bact.rfy_GH_focal) # 5713 (so top 10% is 571 taxa)
+top10 = names(sort(taxa_sums(bact.rfy_GH_focal), TRUE)[1:571])
+bact.rfy_GH_focal.top10 = prune_taxa(top10, bact.rfy_GH_focal)
+ntaxa(bact.rfy_GH_focal.top10) # 571
+
+
+# Non-dominant taxa = lower 90% 
+remainingtaxa = names(sort(taxa_sums(bact.rfy_GH_focal), TRUE)[572:5713])
+bact.rfy_GH_focal.remain = prune_taxa(remainingtaxa, bact.rfy_GH_focal)
+ntaxa(bact.rfy_GH_focal.remain) # 5142
+
+### TOP 10% 
+# extract otu table
+bact.rfy_GH_focal.top10.otu <- t(as.data.frame(as(otu_table(bact.rfy_GH_focal.top10),"matrix")))
+
+# first put rownames in order so that bact and metab sample order match
+bact.rfy_GH_focal.top10.otu <- bact.rfy_GH_focal.top10.otu[ order(rownames(bact.rfy_GH_focal.top10.otu)) , ]
+rownames(bact.rfy_GH_focal.top10.otu)
+
+# these should be the same order for samplenames
+row.names(Metab_imputed2)
+
+# PCA for bacteria - hellinger transformed so that it is appropriate for PCA (euclidean distances)
+otu.top.hel <- decostand(bact.rfy_GH_focal.top10.otu, method = "hellinger")
+pca.top.otu <- rda(otu.top.hel)
+
+plot(pca.top.otu, scaling = 1, display = "sites", type = "point", 
+     main = "PCA for OTU Data")
+
+set.seed(2)
+protest(X = pca.metab , Y = pca.top.otu , scores = "sites", permutations = 9999)
+
+
+###############
+### Non-dominant 
+# extract otu table
+bact.rfy_GH_focal.remain.otu <- t(as.data.frame(as(otu_table(bact.rfy_GH_focal.remain),"matrix")))
+
+# first put rownames in order so that bact and metab sample order match
+bact.rfy_GH_focal.remain.otu <- bact.rfy_GH_focal.remain.otu[ order(rownames(bact.rfy_GH_focal.remain.otu)) , ]
+rownames(bact.rfy_GH_focal.remain.otu)
+
+# these should be the same order for samplenames
+row.names(Metab_imputed2)
+
+# PCA for bacteria - hellinger transformed so that it is appropriate for PCA (euclidean distances)
+otu.remain.hel <- decostand(bact.rfy_GH_focal.remain.otu, method = "hellinger")
+pca.remain.otu <- rda(otu.remain.hel)
+
+plot(pca.remain.otu, scaling = 1, display = "sites", type = "point", 
+     main = "PCA for OTU Data")
+
+set.seed(2)
+protest(X = pca.metab , Y = pca.remain.otu , scores = "sites", permutations = 9999)
+
+
+```
+
+##CCREPE Correlation (supplemental table 5)
+
+  *https://huttenhower.sph.harvard.edu/ccrepe/*
+  *paper that uses ccrepe: https://www.nature.com/articles/s41598-020-59617-9#Sec2 & https://www.frontiersin.org/articles/10.3389/fenvs.2014.00010/full*
+
+```{r}
+
+# I use only the identified metabolites and bacteria grouped at genera-level 
+
+ #  CCREPE provides compositionality-corrected p-values, q-values, and Z-scores for all pairwise correlations within one dataset or between two datasets;
+   #     nc.score, which is an extension of the checkerboard score to ordinal data and thus provides a similarity measure more appropriate for compositional data analysis.
+
+#Install 
+#BiocManager::install("ccrepe")
+library(ccrepe)
+
+# glom at genera
+bact.rfy_GH_focal.genera <- tax_glom(bact.rfy_GH_focal, "Genus")
+ntaxa(bact.rfy_GH_focal.genera)
+
+# make into relative abundance 
+bact.rfy_GH_focal.genera.ra <- transform_sample_counts(bact.rfy_GH_focal.genera, function(x) x/sum(x))
+ntaxa(bact.rfy_GH_focal.genera.ra)  
+
+
+# extract otu table (samples as rows)
+bact.rfy_GH_focal.genera.ra.otu <- t(as.data.frame(as(otu_table(bact.rfy_GH_focal.genera.ra),"matrix")))
+
+
+
+# All metabolites 
+Metab_knowns_imputed.m <- as.matrix(Metab_knowns_imputed)
+rownames(Metab_knowns_imputed.m)
+dim(Metab_knowns_imputed.m)
+
+# order by rownames so that you can match otu file 
+Metab_knowns_imputed.m <- Metab_knowns_imputed.m[ order(rownames(Metab_knowns_imputed.m)) , ]
+
+
+# check that the subjects are matched in the 2 datasets 
+# also check sampledata order because we'll use this for metadata in plotting
+head(cbind(rownames(bact.rfy_GH_focal.genera.ra.otu), rownames(Metab_knowns_imputed.m), rownames(sampledata.GH_focal)))
+
+
+# Run CCREPE 
+
+#min.subj Minimum number of subjects that must be measured in a bug/feature/column in order to apply the similarity measure
+#to that bug/feature/column. This is to ensure that there are sufficient #subjects to perform a bootstrap (default: 20)
+
+set.seed(2)
+ccrepe.bact.metab.all.cn <- ccrepe(x=bact.rfy_GH_focal.genera.ra.otu, y=Metab_knowns_imputed.m, sim.score = nc.score,iterations=20, min.subj=10, verbose = TRUE)
+
+# OUTPUT
+# q.values - corrected (benjamini-hochberg) p.values 
+#sim.score Similarity measure, such as cor or nc.score. This can be either an existing R function or user-defined. If the latter, certain properties should be satisfied as detailed below (also see examples). The default similarity measure is Spearman correlation.
+# Can also specify the sim to be the nc.score - The nc.score similarity measure is an N-dimensional extension of the checkerboard score particularly suited to similarity score calculations between compositions derived from ecological relative abundance measurements. In such cases, features typically represent species abundances, and the NC-score discretizes these continuous values into one of N bins before computing a normalized similarity of co-occurrence or co-exclusion. This can be used as a standalone function or with ccrepe as above to obtain compositionality-corrected p-values.
+
+
+ccrepe.bact.metab.all.padj <- as.data.frame(ccrepe.bact.metab.all.cn$q)
+ccrepe.bact.metab.all.padj <- rownames_to_column(ccrepe.bact.metab.all.padj, "OTU")
+
+ccrepe.bact.metab.all.sim <- as.data.frame(ccrepe.bact.metab.all.cn$sim.score)
+ccrepe.bact.metab.all.sim <- rownames_to_column(ccrepe.bact.metab.all.sim, "OTU")
+
+
+# melt and merge the r values and p values 
+library(reshape2)
+ccrepe.bact.metab.all.padj.melt <- melt(ccrepe.bact.metab.all.padj, value.name = "padj")
+ccrepe.bact.metab.all.sim.melt <- melt(ccrepe.bact.metab.all.sim, value.name = "sim")
+dim(ccrepe.bact.metab.all.padj.melt) 
+dim(ccrepe.bact.metab.all.sim.melt)
+
+ccrepe.bact.metab.allresults <- merge(ccrepe.bact.metab.all.sim.melt, ccrepe.bact.metab.all.padj.melt,by = c("OTU","variable"))
+dim(ccrepe.bact.metab.allresults) 
+View(ccrepe.bact.metab.allresults)
+
+
+# Now add bacterial taxonomy to file 
+tax.focal <- as.data.frame(as(tax_table(bact.rfy_GH_focal.genera.ra),"matrix"))
+tax.focal <- rownames_to_column(tax.focal, "OTU")
+
+ccrepe.bact.metab.allresults.tax <- merge(ccrepe.bact.metab.allresults, tax.focal[,c(1:7)], by = "OTU")
+View(ccrepe.bact.metab.allresults.tax)
+
+#write.csv(ccrepe.bact.metab.allresults.tax, "Ccrepe/2021.08.07_Genera_allKnownMetab_allresults_CNscore.csv")
+
+
+# NOW subset by sig pvalues & r values 
+ccrepe.bact.metab.allresults.tax.SIG <- filter(ccrepe.bact.metab.allresults.tax, padj< 0.05 & sim >= 0.4)
+dim(ccrepe.bact.metab.allresults.tax.SIG) # 6 
+View(ccrepe.bact.metab.allresults.tax.SIG)
+
+
+#write.csv(ccrepe.bact.metab.allresults.tax.SIG, "Ccrepe/2021.08.07_Genera_allKnownMetab_allresults_CNscore_Significant.csv")
+
+
+```
+
+#### Supplemental Figure 7 - Are bacteria that are more abundant in the high malic acid soil incubation also more prevalent when the focal neighbored R.hirta? 
+```{r}
+
+# Use non-transformed data, but subset for the otus that are present in the rarefied dataset 
+taxa.keep <- taxa_names(bact.rfy_SoilInc)
+bact.raw_SoilInc2 <- prune_taxa(taxa.keep,bact.raw_SoilInc)
+ntaxa(bact.raw_SoilInc2)
+ntaxa(bact.rfy_SoilInc)
+
+# subset raw dataset for just focal plants 
+bact.raw_SoilInc.sub <- subset_samples(bact.raw_SoilInc2, treatment == "MA_low" | treatment == "MA_high")
+nsamples(bact.raw_SoilInc.sub)
+
+# glom at genus level (comparison will be MAhigh vs. MAlow)
+bact.raw_SoilInc.sub.genera <- tax_glom(bact.raw_SoilInc.sub, "Genus")
+ntaxa(bact.raw_SoilInc.sub.genera)#503
+
+# RUNNING ANCOMBC
+    # conserve - whether to use a conservative variance estimate of the test statistic. It is recommended if the sample size is small and/or the number of differentially abundant taxa is believed to be large. Default is FALSE.
+
+library(ANCOMBC)
+bact.raw_SoilInc.sub.genera.ancom = ancombc(phyloseq = bact.raw_SoilInc.sub.genera, formula = "treatment", p_adj_method = "holm", zero_cut = 0.90, lib_cut = 0, 
+              group = "treatment", struc_zero = FALSE, neg_lb = FALSE, tol = 1e-5, max_iter = 100, conserve = TRUE, alpha = 0.05, global = FALSE)
+
+
+# output  
+soilinc.ancom_res_df <- data.frame(
+  OTU = row.names(bact.raw_SoilInc.sub.genera.ancom$res$beta),
+  beta = unlist(bact.raw_SoilInc.sub.genera.ancom$res$beta),
+  se = unlist(bact.raw_SoilInc.sub.genera.ancom$res$se),
+  W = unlist(bact.raw_SoilInc.sub.genera.ancom$res$W),
+  p_val = unlist(bact.raw_SoilInc.sub.genera.ancom$res$p_val),
+  q_val = unlist(bact.raw_SoilInc.sub.genera.ancom$res$q_val),
+  diff_abn = unlist(bact.raw_SoilInc.sub.genera.ancom$res$diff_abn))
+
+
+
+# Now we'll look at which treatments have these genera differentially abundant by looking at log-fold change output from primary results
+  #referred to in this question: https://githubmemory.com/repo/FrederickHuangLin/ANCOMBC/issues/25
+
+
+
+# make a result dataframe for primary ancom results 
+# *from: https://www.nicholas-ollberding.com/post/identifying-differentially-abundant-features-in-microbiome-data/
+
+# subset for OTUS that were differentially abundant 
+soil.inc.ancom_difabund <- filter(soilinc.ancom_res_df, diff_abn == "TRUE")
+dim(soil.inc.ancom_difabund) # 24
+
+# merge taxa information with OTU 
+MA.genera.tax <- as.data.frame(as(tax_table(bact.raw_SoilInc.sub.genera),"matrix"))
+MA.genera.tax <- rownames_to_column(MA.genera.tax, "OTU")
+soil.inc.ancom_difabund.tax <- merge(soil.inc.ancom_difabund, MA.genera.tax,"OTU")
+View(soil.inc.ancom_difabund.tax)
+
+#write.csv(soil.inc.ancom_difabund.tax, "Ancom/2021.07.04_SOilInc_AncomGenera_SigDiffAbund_Tax.csv")
+
+## Negative beta is more abundant in the high malic acid treatment, subset for just this
+
+MA.ancom <- filter(soil.inc.ancom_difabund.tax, beta < 0)
+
+print(MA.ancom$Genus)
+
+# glom at genera
+bact.rfy_GH_focal.genera <- tax_glom(bact.rfy_GH_focal, "Genus")
+ntaxa(bact.rfy_GH_focal.genera)
+
+# make into relative abundance 
+bact.rfy_GH_focal.genera.ra <- transform_sample_counts(bact.rfy_GH_focal.genera, function(x) x/sum(x))
+ntaxa(bact.rfy_GH_focal.genera.ra)  
+
+# prune for just the MA indicator genera OTUS
+bact.rfy_GH_focal.genera.ra.MA.idic <- subset_taxa(bact.rfy_GH_focal.genera.ra, Genus == "Brevundimonas" | Genus == "Pedobacter" | Genus == "Pseudoxanthomonas" | Genus == "Pseudospirillum" | Genus == "Hirschia" | Genus == "Flavitalea" | Genus == "Chryseolinea" )
+
+ntaxa(bact.rfy_GH_focal.genera.ra.MA.idic)
+
+# melt into a dataframe for plotting 
+bact.rfy_GH_focal.genera.ra.MA.idic.df <- psmelt(bact.rfy_GH_focal.genera.ra.MA.idic)
+
+# use sampledata.GH_focal
+bact.rfy_GH_focal.genera.ra.MA.idic.df$treatment <- factor(bact.rfy_GH_focal.genera.ra.MA.idic.df$treatment, levels = c("SL_0", "SL_SL", "SL_BBS", "SL_JG", "SL_S"))
+GH_focal_colors.cb <- c("darkseagreen4","darkcyan","slategray1","thistle3","lightgoldenrod")
+X.focal.labels <- c("No Neighbor", "P.virgatum", "A.gerardii", "K.macrantha", "R.hirta")
+
+ggplot(bact.rfy_GH_focal.genera.ra.MA.idic.df, aes(y = Abundance, x = treatment, fill = treatment)) + 
+  geom_boxplot(alpha = 1.0) + 
+   geom_point(pch = 21, position = position_jitterdodge()) +
+ scale_fill_manual(values = c(GH_focal_colors.cb)) +
+  scale_x_discrete(labels= X.focal.labels) +
+  labs(x = "Plant Neighbor", y = "Relative Abundance") + facet_wrap(~Genus, scales = "free_y") +
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 15),
+ axis.text.x = element_text(size = 8, color ="black",face=c("plain","italic","italic","italic","italic")),
+axis.title.y = element_text(size = 15),
+      axis.text.y = element_text(size = 15, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  strip.text.x = element_text(size = 15, face = c("italic","italic","italic","italic","italic","italic","italic")),
+  legend.position="none", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+######################
+### Stats supplemental figure 7 
+
+#### Brevundimonas 
+brevundimonas.ra <- filter(bact.rfy_GH_focal.genera.ra.MA.idic.df, Genus == "Brevundimonas")
+
+ggqqplot(brevundimonas.ra$Abundance)
+hist(brevundimonas.ra$Abundance)
+lm = lm(Abundance ~ treatment, data = brevundimonas.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+brevundimonas.anova <- lm(Abundance ~ treatment, data = brevundimonas.ra)
+plot(brevundimonas.anova)
+Anova(brevundimonas.anova, type = "III")
+
+
+#### Chryseolinea 
+chryseolinea.ra <- filter(bact.rfy_GH_focal.genera.ra.MA.idic.df, Genus == "Chryseolinea")
+
+ggqqplot(chryseolinea.ra$Abundance)
+hist(chryseolinea.ra$Abundance)
+lm = lm(Abundance ~ treatment, data = chryseolinea.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+chryseolinea.anova <- lm(Abundance ~ treatment, data = chryseolinea.ra)
+plot(chryseolinea.anova)
+Anova(chryseolinea.anova, type = "III")
+
+#### Flavitalea 
+Flavitalea.ra <- filter(bact.rfy_GH_focal.genera.ra.MA.idic.df, Genus == "Flavitalea")
+
+ggqqplot(Flavitalea.ra$Abundance)
+hist(Flavitalea.ra$Abundance)
+lm = lm(Abundance ~ treatment, data = Flavitalea.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+Flavitalea.anova <- lm(Abundance ~ treatment, data = Flavitalea.ra)
+plot(Flavitalea.anova)
+Anova(Flavitalea.anova, type = "III")
+
+#### Hirschia
+Hirschia.ra <- filter(bact.rfy_GH_focal.genera.ra.MA.idic.df, Genus == "Hirschia")
+
+ggqqplot(Hirschia.ra$Abundance)
+hist(Hirschia.ra$Abundance)
+lm = lm(Abundance ~ treatment, data = Hirschia.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+Hirschia.anova <- lm(Abundance ~ treatment, data = Hirschia.ra)
+plot(Hirschia.anova)
+Anova(Hirschia.anova, type = "III")
+
+
+#### Pedobacter
+Pedobacter.ra <- filter(bact.rfy_GH_focal.genera.ra.MA.idic.df, Genus == "Pedobacter")
+
+ggqqplot(Pedobacter.ra$Abundance)
+hist(Pedobacter.ra$Abundance)
+lm = lm(Abundance ~ treatment, data = Pedobacter.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+Pedobacter.anova <- lm(Abundance ~ treatment, data = Pedobacter.ra)
+plot(Pedobacter.anova)
+Anova(Pedobacter.anova, type = "III")
+
+#### Pseudospirillum
+Pseudospirillum.ra <- filter(bact.rfy_GH_focal.genera.ra.MA.idic.df, Genus == "Pseudospirillum")
+
+ggqqplot(Pseudospirillum.ra$Abundance)
+hist(Pseudospirillum.ra$Abundance)
+lm = lm(Abundance ~ treatment, data = Pseudospirillum.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+Pseudospirillum.anova <- lm(Abundance ~ treatment, data = Pseudospirillum.ra)
+plot(Pseudospirillum.anova)
+Anova(Pseudospirillum.anova, type = "III")
+
+#### Pseudoxanthomonas
+Pseudoxanthomonas.ra <- filter(bact.rfy_GH_focal.genera.ra.MA.idic.df, Genus == "Pseudoxanthomonas")
+
+ggqqplot(Pseudoxanthomonas.ra$Abundance)
+hist(Pseudoxanthomonas.ra$Abundance)
+lm = lm(Abundance ~ treatment, data = Pseudoxanthomonas.ra)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# Anova
+Pseudoxanthomonas.anova <- lm(Abundance ~ treatment, data = Pseudoxanthomonas.ra)
+plot(Pseudoxanthomonas.anova)
+Anova(Pseudoxanthomonas.anova, type = "III")
+
+
+
+```
+---
+# SOIL INCUBATION BACTERIA
+* I only used the Water control, High Malic Acid and Low Malic Acid Treatments from this dataset *
+```{r}
+
+# subset for just water control and malic acid treatments
+bact.rfy_SoilInc.sub <- subset_samples(bact.rfy_SoilInc, treatment=="MA_high" | treatment == "MA_low"  | treatment == "Water")
+
+
+# make sampledata into a dataframe 
+sampledata.SoilInc.sub <- as.data.frame(as(sample_data(bact.rfy_SoilInc.sub),"matrix"))
+
+
+
+```
+## bacterial community betadiversity stats 
+```{r}
+
+### Betadispersion and permanova   
+set.seed(2)
+bact.rfy_SoilInc.sub_wunifrac<- phyloseq::distance(bact.rfy_SoilInc.sub, "wunifrac")
+
+
+# Beta-Dispersion test
+  # permonva adonis test assumes equal variance among the groups, so we need to check this first 
+  # this tests if there is a differences in the spread/dispersial/variability among groups 
+set.seed(2)
+betadisp <- betadisper(bact.rfy_SoilInc.sub_wunifrac,group = sample_data(bact.rfy_SoilInc.sub)$treatment,type = "centroid")
+permutest(betadisp) 
+boxplot(betadisp)
+
+
+# pairwise betadispersion 
+betadisp.TukeyHSD <- TukeyHSD(betadisp, conf.level = 0.95)
+betadisp.TukeyHSD
+
+
+
+## Permanova
+set.seed(2)
+permanova <- adonis(bact.rfy_SoilInc.sub_wunifrac~sample_data(bact.rfy_SoilInc.sub)$treatment, permutations = 9999, method = "wunifrac")
+permanova
+
+# Pairwise Adonis 
+library(RVAideMemoire)
+
+vector <- as.vector(sample_data(bact.rfy_SoilInc.sub)$treatment)
+pairwise.perm.manova(bact.rfy_SoilInc.sub_wunifrac, vector, p.method = "fdr")
+
+##### ONLY Malic Acid treatments 
+### Betadispersion and permanova 
+bact.rfy_SoilInc.MA <- subset_samples(bact.rfy_SoilInc.sub, treatment == "MA_high" | treatment == "MA_low")
+
+set.seed(2)
+bact.rfy_SoilInc.MA_wunifrac<- phyloseq::distance(bact.rfy_SoilInc.MA, "wunifrac")
+
+set.seed(2)
+permanova <- adonis(bact.rfy_SoilInc.MA_wunifrac~sample_data(bact.rfy_SoilInc.MA)$treatment, permutations = 9999, method = "wunifrac")
+permanova
+
+
+```
+### Indicator Genra for high & low malic acid incubation (Supplemental Table 6)
+```{r}
+
+# subset for just malic acid 
+bact.rfy_SoilInc.MA <- subset_samples(bact.rfy_SoilInc, treatment=="MA_high" | treatment == "MA_low")
+
+bact.rfy_SoilInc.MA.genus <- tax_glom(bact.rfy_SoilInc.MA, "Genus")
+
+
+# data needs to have samples in rows and species in columns (opposite of phyloseq)
+bact.rfy_SoilInc.MA.genus.otu <- as.data.frame(t(as(otu_table(bact.rfy_SoilInc.MA.genus), "matrix")))
+dim(bact.rfy_SoilInc.MA.genus.otu) # 25 503
+bact.rfy_SoilInc.MA_samp<- as.data.frame(as(sample_data(bact.rfy_SoilInc.MA),"matrix"))
+
+#############
+# multiplatt is the function used to conduct indicator species analysis
+  # duleg = T makes it so we avoid considering grouping combinations
+  # func = IndVal.g sets our test statistic as the INdVal index (returns sq.rt of IndVal)
+  # indvalcomp=TRUE will give us the separate A and B parameters for the indicator species. A indicates the probablity that the Sample belongs to the identified sample given the species in the sample (specificity); B is the probablity of finding the species in the sample belonging to that group (sensitivity) 
+
+library(indicspecies)
+# by variety 
+bact.rfy_SoilInc.MA.Genus<- multipatt(bact.rfy_SoilInc.MA.genus.otu,
+                         bact.rfy_SoilInc.MA_samp$treatment, duleg = TRUE, # in future make duleg = TRUE so it doesn't consider other site combinations
+                       control = how(nperm = 9999),func = "IndVal.g")
+
+
+
+# send ISA summary results to a file 
+ sink("2021.05.11_SoilInoc_MAtrts_IndicSp_Genra_perm9999.csv")
+print(summary(bact.rfy_SoilInc.MA.Genus, indvalcomp=TRUE))
+sink()
+# exported this table and organized into columns 
+
+###############################
+### Indicator Padjust#########
+
+# read in indicator taxa organized csv file 
+#IndSp <- read.csv("2021.05.11_SoilInoc_MAtrts_IndicSp_Genra_perm9999.csv", header = TRUE)
+
+# read in list of pvalues from primer pairwise analysis 
+IndSp_p <-IndSp$p.value
+
+# confirm that read list is a vector
+is.vector(IndSp_p)
+IndSp_p <- as.numeric(IndSp_p)
+
+library(stats)
+IndSp_p_fdr <- as.matrix(p.adjust(IndSp_p, method = "fdr", length(IndSp_p)))
+colnames(IndSp_p_fdr) <- "p_value_fdr"
+length(IndSp_p_fdr)
+
+
+Tax <- as.data.frame(as(tax_table(bact.rfy_SoilInc.MA.genus),"matrix")) # taxonomy table with OTU column to merge with indsp results 
+Tax <- rownames_to_column(Tax, "OTU")
+IndSp_tax <- merge(Tax, IndSp, by = "OTU")
+
+
+IndSp_p_fdr_merge <- cbind(IndSp_tax, IndSp_p_fdr)
+
+#write.csv(IndSp_p_fdr_merge, "2021.05.11_SoilInoc_MAtrts_IndicSp_Genra_perm9999_TaxPadjust.csv")
+
+
+
+```
+
+## Figure 5 - Soil Incubation TOC & TN 
+```{r}
+
+
+# subset for just water control and malic acid 
+sampledata.SoilInc.plot <- filter(sampledata.SoilInc, treatment=="MA_high" | treatment == "MA_low"  | treatment == "Water")
+
+sampledata.SoilInc.plot <- droplevels(sampledata.SoilInc.plot)
+
+#reorder 
+sampledata.SoilInc.plot$treatment<- factor(sampledata.SoilInc.plot$treatment, levels = c("MA_high", "MA_low", "Water"))
+
+soilinc_MA_colors.cb <- c("gray38", "gray75", "white")
+
+
+
+  ### DOC                                   
+
+SI.DOC <- ggplot(sampledata.SoilInc.plot, aes(y = unfumigated_DOC_concentration_ugC_gsoil, x = treatment, fill = treatment)) + 
+  geom_boxplot(alpha = 1.0) + 
+   geom_point(pch = 21, position = position_jitterdodge()) +
+ scale_fill_manual(values = c(soilinc_MA_colors.cb)) +
+  scale_x_discrete(labels= c("high malic acid", "low malic acid", "water")) +
+  labs( y = "Dissolved Organic Carbon (ug/g)", x = "Exudate Treatment") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_blank(),
+ axis.text.x = element_blank(),
+axis.title.y = element_text(size = 19),
+      axis.text.y = element_text(size = 15, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 15),
+      legend.title = element_text(size = 15),
+      legend.position="none", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+SI.DOC
+
+
+### TN 
+
+SI.TN <- ggplot(sampledata.SoilInc.plot, aes(y = unfumigated_TN_concentration_ugN_gsoil, x = treatment, fill = treatment)) + 
+  geom_boxplot(alpha = 1.0) + 
+   geom_point(pch = 21, position = position_jitterdodge()) +
+ scale_fill_manual(values = c(soilinc_MA_colors.cb)) +
+  scale_x_discrete(labels= c("high malic acid", "low malic acid", "water")) +
+  labs(x = "Exudate Treatment", y = "Total Soil Extractable Nitrogen (ug/g)") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_blank(),
+ axis.text.x = element_blank(),
+axis.title.y = element_text(size = 19),
+      axis.text.y = element_text(size = 15, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 15),
+      legend.title = element_text(size = 15),
+      legend.position="none", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+SI.TN
+
+ ### MBC                                   
+
+SI.MBC <- ggplot(sampledata.SoilInc.plot, aes(y = ugC_MicBiomass_g_dry_soil, x = treatment, fill = treatment)) + 
+  geom_boxplot(alpha = 1.0) + 
+   geom_point(pch = 21, position = position_jitterdodge()) +
+ scale_fill_manual(values = c(soilinc_MA_colors.cb)) +
+  scale_x_discrete(labels= c("high malic acid", "low malic acid", "water")) +
+  labs(x = "Exudate Treatment", y = "Microbial Biomass Carbon (ug C/g)") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 20),
+ axis.text.x = element_text(size = 15, color ="black"),
+axis.title.y = element_text(size = 19),
+      axis.text.y = element_text(size = 15, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 15),
+      legend.title = element_text(size = 15),
+      legend.position="none", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+SI.MBC
+
+ ### MBN                                   
+
+SI.MBN <- ggplot(sampledata.SoilInc.plot, aes(y = ugN_MicBiomass_g_dry_soil, x = treatment, fill = treatment)) + 
+  geom_boxplot(alpha = 1.0) + 
+   geom_point(pch = 21, position = position_jitterdodge()) +
+ scale_fill_manual(values = c(soilinc_MA_colors.cb)) +
+  scale_x_discrete(labels= c("high malic acid", "low malic acid", "water")) +
+  labs(x = "Exudate Treatment", y = "Microbial Biomass Nitrogen (ug N/g)") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 20),
+ axis.text.x = element_text(size = 15, color ="black"),
+axis.title.y = element_text(size = 19),
+      axis.text.y = element_text(size = 15, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 15),
+      legend.title = element_text(size = 15),
+      legend.position="none", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+SI.MBN
+
+
+#### Arrange all these plots together 
+library('ggpubr')
+
+ ggarrange(SI.DOC, SI.TN, SI.MBC, SI.MBN,
+                    labels = c("A","B","C","D"),
+                    ncol = 2, nrow = 2, 
+                   heights = 1, widths = 2,
+                    common.legend = TRUE, legend = "none",
+            align = "hv")
+
+
+```
+---
+# GREENHOUSE METADATA
+#### Supplemental Figure 2 - RII & neighbor biomass 
+```{r}
+# RII - first run code in RII section to generate dataframe sampledata.GH_focal.biomass2
+
+# Remove SL_0 from this dataset because it's just the reference 
+sampledata.GH_focal.Rii <- filter(sampledata.GH_focal.biomass2, treatment != "SL_0")
+
+sampledata.GH_focal.Rii$treatment <- factor(sampledata.GH_focal.Rii$treatment, levels = c("SL_SL", "SL_BBS", "SL_JG", "SL_S"))
+GH_focal_colors.cb.rii <- c("darkcyan", "slategray1", "thistle3", "lightgoldenrod")
+X.focal.labels.rii <- c("P.virgatum", "A.gerardii", "K.macrantha", "R.hirta")
+
+Rii_AG.plot <- ggplot(sampledata.GH_focal.Rii, aes(y = Rii_AG, x = treatment, fill = treatment)) + 
+  geom_boxplot(alpha = 1.0) + 
+   geom_point(pch = 21, position = position_jitterdodge()) +
+ scale_fill_manual(values = c(GH_focal_colors.cb.rii)) +
+  scale_x_discrete(labels= X.focal.labels.rii) +
+  labs(x = "Plant Neighbor", y = "Focal Plant Aboveground RII") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 20),
+ axis.text.x = element_text(size = 15, color ="black",face=c("italic","italic","italic","italic")),
+axis.title.y = element_text(size = 20),
+      axis.text.y = element_text(size = 20, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 20),
+      legend.title = element_text(size = 20),
+      legend.position="none", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+
+
+
+#### Neighbor Biomass
+neighbor <- filter(sampledata.GH, treatment == "SL_SL" | treatment == "SL_BBS" | treatment == "SL_JG" | treatment == "SL_S")
+neighbor <- filter(neighbor, position_name == "neighbor")
+
+neighborbiomass <- select(neighbor, "AG_g","BG_g","X.SampleID")
+library(reshape2)
+neighborbiomass1 <- melt(neighborbiomass, id.vars = "X.SampleID")
+neighborbiomass2 <- merge(neighborbiomass1, sampledata.GH[,c(1,9)], by = "X.SampleID")
+
+
+
+# Reorder so that all plots are the same
+# use sampledata.GH_focal
+neighborbiomass2$treatment <- factor(neighborbiomass2$treatment, levels = c("SL_SL", "SL_BBS", "SL_JG", "SL_S"))
+
+X.focal.labels <- c("P.virgatum", "A.gerardii", "K.macrantha", "R.hirta")
+
+NeighBiomass.plot <- ggplot(neighborbiomass2, aes(y = value, x = treatment, fill = variable)) +  geom_boxplot() + 
+   geom_point(pch = 21, position = position_jitterdodge()) +
+  scale_fill_manual(values = c("gray","white"), labels = c("Aboveground","Belowground")) +
+   scale_x_discrete(labels= X.focal.labels) +
+  labs(x = "Plant Neighbor", y = "Neighbor Plant Biomass (g)") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 20),
+    axis.text.x = element_text(size = 15, color ="black",face=c("italic","italic","italic","italic")),
+axis.title.y = element_text(size = 20),
+      axis.text.y = element_text(size = 15, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 20),
+      legend.title = element_text(size = 20),
+      legend.position="none", #remove legend  
+  plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+### Plot together
+ ggarrange(NeighBiomass.plot,Rii_AG.plot,
+                    labels = c("A", "B"),
+                    ncol = 2, nrow = 1, 
+                    widths = c(1,1,1,1), heights = c(1,1,1,1),
+                      common.legend = FALSE, legend = "none",
+            align = "hv")
+
+
+
+
+```
+#### Supplemental Figure 3 - GH Soil moisture & Soil NO3
+```{r}
+
+# reorder
+sampledata.GH_focal$treatment <- factor(sampledata.GH_focal$treatment, levels = c("SL_0", "SL_SL", "SL_BBS", "SL_JG", "SL_S"))
+
+
+
+GH_focal_colors.cb <- c("darkseagreen4", "darkcyan", "slategray1", "thistle3", "lightgoldenrod")
+X.focal.labels <- c("No Neighbor", "P.virgatum", "A.gerardii", "K.macrantha", "R.hirta")
+
+# Remove extreme outliers in dataset > 85 % soil moisture 
+sampledata.GH_focal$SMC_perc_dryweight_noOut <- sampledata.GH_focal$SMC_perc_dryweight
+
+sampledata.GH_focal$SMC_perc_dryweight_noOut[sampledata.GH_focal$SMC_perc_dryweight_noOut >85] <- NA
+
+plot_focal_SMC <- ggplot(sampledata.GH_focal, aes(y = SMC_perc_dryweight_noOut, x = treatment, fill = treatment)) + 
+geom_boxplot(alpha = 1.0) + 
+   geom_point(pch = 21, position = position_jitterdodge()) +
+ scale_fill_manual(values = c(GH_focal_colors.cb)) +
+  scale_x_discrete(labels= X.focal.labels) +
+  labs(x = "Plant Neighbor", y = "Gravimetric Soil Moisture Content (g/g dry soil)") +   theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 15),
+    axis.text.x = element_text(size = 10, color ="black",face=c("plain","italic","italic","italic","italic")),
+axis.title.y = element_text(size = 15),
+      axis.text.y = element_text(size = 10, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 10),
+      legend.title = element_text(size = 15),
+      legend.position="none", #remove legend  
+  plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+
+###########
+
+plot_focal_nitrate <- ggplot(sampledata.GH_focal, aes(y = NO3_ppm, x = treatment, fill = treatment)) + 
+ geom_boxplot(alpha = 1.0) + 
+   geom_point(pch = 21, position = position_jitterdodge()) +
+ scale_fill_manual(values = c(GH_focal_colors.cb)) +
+  scale_x_discrete(labels= X.focal.labels) +
+  labs(x = "Plant Neighbor", y = "Soil Nitrate (ppm)") +   theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 15),
+    axis.text.x = element_text(size = 10, color ="black",face=c("plain","italic","italic","italic","italic")),
+axis.title.y = element_text(size = 15),
+      axis.text.y = element_text(size = 10, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 10),
+      legend.title = element_text(size = 15),
+      legend.position="none", #remove legend  
+  plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+
+################### PUT plots together 
+ ggarrange(plot_focal_SMC, plot_focal_nitrate,
+                    labels = c("A", "B"),
+                    ncol = 2, nrow = 1, 
+                    widths = c(1,1,1,1), heights = c(1,1,1,1),
+                      common.legend = TRUE, legend = "none",
+            align = "hv")
+
+```
+
+
+## Rii competition index 
+```{r}
+#relative interaction intensity (RII), a robust metric of plant competition (Armas, Ordiales, & Pugnaire, 2004; Díaz-Sierra, Verwijmeren, Rietkerk, Dios, & Baudena, 2017), using the formula:
+      # Rii = (biomassN - biomassA)/(biomassN + biomassA)
+#where biomassN is the biomass of a target individual of a given species growing with a conspecific or congener neighbour, and biomassA is the mean biomass of that target species growing alone in the corresponding soil origin and microbe treatment combination. 
+    #Negative RII values indicate that the target plant growth is suppressed by its neighbour through competition, and positive values indicate facilitation; the RII metric takes values from −1 to +1 and is thus preferable to other traditional competition metrics (Díaz-Sierra et al., 2017). 
+
+
+# filter for just the relevant columns
+sampledata.GH_focal.biomass <- select(sampledata.GH_focal, "treatment","Rep", "AG_g","BG_g","totalbiomass_g")
+ 
+# add a new column specifying the AGbiomass, BGbiomass, and total biomass for SG_0 treatment by rep
+sampledata.GH_focal.biomass2 <- sampledata.GH_focal.biomass %>% 
+  mutate(AG_g.alone = case_when(Rep == 1 ~ 4.75,
+                                Rep == 2 ~ 2.95,
+                                Rep == 3 ~ 6.23,
+                                Rep == 4 ~ 7.70, 
+                                Rep == 5 ~ 6.59), 
+      BG_g.alone = case_when(Rep == 1 ~ 1.40,
+                                Rep == 2 ~ 1.42,
+                                Rep == 3 ~ 2.08,
+                                Rep == 4 ~ 2.53, 
+                                Rep == 5 ~ 3.00),
+ totalbiomass_g.alone = case_when(Rep == 1 ~ 6.15,
+                                Rep == 2 ~ 4.37,
+                                Rep == 3 ~ 8.31,
+                                Rep == 4 ~ 10.23, 
+                                Rep == 5 ~ 9.59))
+
+# calculate Rii by replicate 
+# Aboveground biomass
+sampledata.GH_focal.biomass2$Rii_AG <- ((sampledata.GH_focal.biomass2$AG_g - sampledata.GH_focal.biomass2$AG_g.alone)/(sampledata.GH_focal.biomass2$AG_g + sampledata.GH_focal.biomass2$AG_g.alone))
+
+# Belowground biomass 
+sampledata.GH_focal.biomass2$Rii_BG <- ((sampledata.GH_focal.biomass2$BG_g - sampledata.GH_focal.biomass2$BG_g.alone)/(sampledata.GH_focal.biomass2$BG_g + sampledata.GH_focal.biomass2$BG_g.alone))
+
+# Total biomass 
+sampledata.GH_focal.biomass2$Rii_total <- ((sampledata.GH_focal.biomass2$totalbiomass_g - sampledata.GH_focal.biomass2$totalbiomass_g.alone)/(sampledata.GH_focal.biomass2$totalbiomass_g + sampledata.GH_focal.biomass2$totalbiomass_g.alone))
+
+
+######## PLOT 
+# Reorder so that all plots are the same
+# use sampledata.GH_focal
+
+# Remove SL_0 from this dataset because it's just the reference 
+sampledata.GH_focal.Rii <- filter(sampledata.GH_focal.biomass2, treatment != "SL_0")
+
+sampledata.GH_focal.Rii$treatment <- factor(sampledata.GH_focal.Rii$treatment, levels = c("SL_SL", "SL_BBS", "SL_JG", "SL_S"))
+GH_focal_colors.cb.rii <- c("#E69F00", "#56B4E9", "#0072B2", "#F0E442")
+X.focal.labels.rii <- c("P.virgatum", "A.gerardii", "K.macrantha", "R.hirta")
+
+Rii_AG.plot <- ggplot(sampledata.GH_focal.Rii, aes(y = Rii_AG, x = treatment, fill = treatment)) + 
+  geom_boxplot(alpha = 0.5) + 
+   geom_point(pch = 21, position = position_jitterdodge()) +
+ scale_fill_manual(values = c(GH_focal_colors.cb.rii)) +
+  scale_x_discrete(labels= X.focal.labels.rii) +
+  labs(x = "Plant Neighbor", y = "Aboveground RII") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 15),
+ axis.text.x = element_text(size = 10, color ="black",face=c("italic","italic","italic","italic")),
+axis.title.y = element_text(size = 12),
+      axis.text.y = element_text(size = 15, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 15),
+      legend.title = element_text(size = 15),
+      legend.position="none", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+
+Rii_BG.plot <- ggplot(sampledata.GH_focal.Rii, aes(y = Rii_BG, x = treatment, fill = treatment)) + 
+  geom_boxplot(alpha = 0.5) + 
+   geom_point(pch = 21, position = position_jitterdodge()) +
+ scale_fill_manual(values = c(GH_focal_colors.cb.rii)) +
+  scale_x_discrete(labels= X.focal.labels.rii) +
+  labs(x = "Plant Neighbor", y = "Belowground RII") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 15),
+ axis.text.x = element_text(size = 10, color ="black",face=c("italic","italic","italic","italic")),
+axis.title.y = element_text(size = 12),
+      axis.text.y = element_text(size = 15, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 15),
+      legend.title = element_text(size = 15),
+      legend.position="none", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+
+
+
+Rii_total.plot <- ggplot(sampledata.GH_focal.Rii, aes(y = Rii_total, x = treatment, fill = treatment)) + 
+  geom_boxplot(alpha = 0.5) + 
+   geom_point(pch = 21, position = position_jitterdodge()) +
+ scale_fill_manual(values = c(GH_focal_colors.cb.rii)) +
+  scale_x_discrete(labels= X.focal.labels.rii) +
+  labs(x = "Plant Neighbor", y = "Total Biomass RII") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 25), 
+  axis.title.x = element_text(size = 15),
+ axis.text.x = element_text(size = 10, color ="black",face=c("italic","italic","italic","italic")),
+axis.title.y = element_text(size = 12),
+      axis.text.y = element_text(size = 15, color = "black"),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 15),
+      legend.title = element_text(size = 15),
+      legend.position="none", #remove legend, 
+ plot.margin=unit(c(.5,1,.5,.5),"cm")) # add margins
+
+###############
+### Stats
+
+##### AG RII 
+Rii.AG_model <- lm(Rii_AG ~ treatment, data = sampledata.GH_focal.Rii)
+plot(Rii.AG_model)
+Anova(Rii.AG_model, type = "III")
+
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(Rii.AG_model,
+                   ~ treatment)
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+
+################
+# BG RII 
+Rii.BG_model <- lm(Rii_BG ~ treatment, data = sampledata.GH_focal.Rii)
+plot(Rii.BG_model)
+Anova(Rii.BG_model, type = "III")
+
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(Rii.BG_model,
+                   ~ treatment)
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+### Total biomass RII 
+Rii.total_model <- lm(Rii_total ~ treatment, data = sampledata.GH_focal.Rii)
+plot(Rii.total_model)
+Anova(Rii.total_model, type = "III")
+
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(Rii.total_model,
+                   ~ treatment)
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+```
+
+
+##  Biomass
+### Monocultures 
+```{r}
+sampledata.GH_mono <- filter(sampledata.GH, treatment == "SL_SL" | treatment == "BBS_BBS" | treatment == "S_S"|treatment == "JG_JG")
+
+
+mono_Totalbiomass_model <- lm(totalbiomass_g ~ treatment, data = sampledata.GH_mono)
+plot(mono_Totalbiomass_model)
+Anova(mono_Totalbiomass_model, type = "III")
+
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(mono_Totalbiomass_model,
+                   ~ treatment)
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+
+# Summarize means  
+sampledata.GH_mono %>%
+  group_by(treatment) %>%
+  summarise(mean = mean(totalbiomass_g))
+avg <- mean(4.25,3.25,1.95)
+9.58/avg # 2.2 x more biomass in R.hirta monoculture
+
+#####################
+# mono AG_g Biomass
+####################
+
+mono_AGbiomass_model <- lm(AG_g ~ treatment, data = sampledata.GH_mono)
+plot(mono_AGbiomass_model)
+Anova(mono_AGbiomass_model, type = "III")
+
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(mono_AGbiomass_model,
+                   ~ treatment)
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+
+#####################
+# mono BG_g Biomass
+
+mono_BGbiomass_model <- lm(BG_g ~ treatment, data = sampledata.GH_mono)
+plot(mono_BGbiomass_model)
+Anova(mono_BGbiomass_model, type = "III")
+
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(mono_BGbiomass_model,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+```
+### Focal Treatments  
+```{r}
+#####################
+# Focal Total Biomass
+#####################
+
+focal_Totalbiomass_model <- lm(totalbiomass_g ~ treatment, data = sampledata.GH_focal)
+plot(focal_Totalbiomass_model)
+Anova(focal_Totalbiomass_model, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(focal_Totalbiomass_model,
+                   ~ treatment)
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+# Summarize means  
+sampledata.GH_focal %>%
+  group_by(treatment) %>%
+  summarise(mean = mean(totalbiomass_g))
+
+# fold difference between SL-S and average of others 
+avg <- mean(7.73, 5.29, 5.61, 5.19)
+(avg- 2.38)/2.38 # 2.2 - biomass was on average 2.2 fold greater in all treatments compared to when focal was with R.hirta 
+
+# how much less biomass in SL_S than SL_0? 
+(7.73-2.38)/7.73
+# 70% less 
+
+
+
+#####################
+# Focal AG_g Biomass
+####################
+
+focal_AGbiomass_model <- lm(AG_g ~ treatment, data = sampledata.GH_focal)
+plot(focal_AGbiomass_model)
+Anova(focal_AGbiomass_model, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(focal_AGbiomass_model,
+                   ~ treatment)
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD  
+
+
+
+#####################
+# Focal BG_g Biomass
+
+focal_BGbiomass_model <- lm(BG_g ~ treatment, data = sampledata.GH_focal)
+plot(focal_BGbiomass_model)
+Anova(focal_BGbiomass_model, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(focal_BGbiomass_model,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+```
+### Neighbor (non P.virgatum species in neighborhoods) stats
+```{r}
+#####################
+# Neighbor BG 
+neighbor <- filter(sampledata.GH, treatment == "SL_SL" | treatment == "SL_BBS" | treatment == "SL_JG" | treatment == "SL_S")
+neighbor <- filter(neighbor, position_name == "neighbor")
+
+BG_neighbor_model <- lm(BG_g ~ treatment, data = neighbor)
+plot(BG_neighbor_model)
+res = BG_neighbor_model$residuals 
+shapiro.test(res) 
+
+Anova(BG_neighbor_model, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(BG_neighbor_model,
+                   ~ treatment)
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+# Summarize means  
+NeighborBG <- neighbor %>%
+  group_by(treatment) %>%
+  summarise(NeighborBG = (mean(BG_g, na.rm = T)))
+NeighborBG
+
+# fold difference between SL-S and average of others 
+avg <- mean(0.582,0.788,1.33)
+(2.24-avg)/avg # average of 2.8xmore belowground biomass of R.hirta neighbor compared to other neighbor specise 
+
+
+
+#####################
+# Neighbor AG 
+
+AG_neighbor_model <- lm(AG_g ~ treatment, data = neighbor)
+plot(AG_neighbor_model)
+Anova(AG_neighbor_model, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(AG_neighbor_model,
+                   ~ treatment)
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="tukey")         ###  Tukey-adjusted comparisons
+CLD
+
+
+# Summarize means  
+NeighborAG <- neighbor %>%
+  group_by(treatment) %>%
+  summarise((mean(AG_g, na.rm = T)))
+NeighborAG
+
+# fold difference between SL-S and average of others 
+avg <- mean(1.01,1.14,2.93)
+(11.8-avg)/avg # 10.7 X more ag biomass of r.hirta neighbor compared to other species 
+
+```
+
+## Gravimetric Soil Moisture Content 
+### check for outliers 
+```{r}
+IQR.outliers <- function(x) {
+  if(any(is.na(x)))
+    stop("x is missing values")
+  if(!is.numeric(x))
+    stop("x is not numeric")
+  Q3<-quantile(x,0.75)
+  Q1<-quantile(x,0.25)
+  IQR<-(Q3-Q1)
+  left<- (Q1-(3*IQR))
+  right<- (Q3+(3*IQR))
+  c(x[x <left],x[x>right])
+}
+
+sampledata.GH_noinitial <- filter(sampledata.GH, treatment != "InitialSoil")
+IQR.outliers(sampledata.GH_noinitial$SMC_perc_dryweight) 
+# four points > 85% soil moisture, 3x outside IQR 
+
+```
+
+### Focal Treatments
+```{r} 
+
+
+# Remove extreme outliers in dataset > 85 % soil moisture 
+sampledata.GH_focal$SMC_perc_dryweight_noOut <- sampledata.GH_focal$SMC_perc_dryweight
+
+sampledata.GH_focal$SMC_perc_dryweight_noOut[sampledata.GH_focal$SMC_perc_dryweight_noOut >85] <- NA
+
+################
+### Stats
+
+
+# test for normal residuals and equal variances (ANOVA assumptions)
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(sampledata.GH_focal$SMC_perc_dryweight_noOut)
+hist(sampledata.GH_focal$SMC_perc_dryweight_noOut)
+lm = lm((SMC_perc_dryweight_noOut) ~ treatment, data = sampledata.GH_focal)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# 2) homoegeneity of variances
+bartlett.test(SMC_perc_dryweight_noOut ~ treatment , data = sampledata.GH_focal) 
+
+# Anova - >2factors with normal residuals and variances 
+smc_model.focal <- lm(SMC_perc_dryweight_noOut ~ treatment, data = sampledata.GH_focal)
+plot(smc_model.focal)
+Anova(smc_model.focal, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(smc_model.focal,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+# Summarize means  
+# Summarize means  
+SMC_means <- sampledata.GH_focal %>%
+  group_by(treatment) %>%
+  summarise(MeanSMC = (mean(SMC_perc_dryweight_noOut, na.rm = T)))
+SMC_means
+
+
+# fold difference between SL-S and average of others 
+avg <- mean(42.1,41.3,38.7,37.2)
+(avg-26.2)/avg # 38% lower in R.hirta neighborhood 
+
+```
+
+### Monocultures
+```{r}
+# filter so we don't have duplicate values per pot 
+sampledata.GH_mono <- filter(sampledata.GH, treatment == "SL_SL" | treatment == "BBS_BBS" | treatment == "S_S"|treatment == "JG_JG")
+
+sampledata.GH_mono <- sampledata.GH_mono %>%  distinct(potID, .keep_all = TRUE)
+dim(sampledata.GH_mono)
+
+
+# Remove extreme outliers in dataset > 85 % soil moisture 
+sampledata.GH_mono$SMC_perc_dryweight_noOut <- sampledata.GH_mono$SMC_perc_dryweight
+
+sampledata.GH_mono$SMC_perc_dryweight_noOut[sampledata.GH_mono$SMC_perc_dryweight_noOut >85] <- NA
+
+### Stats
+
+# test for normal residuals and equal variances (ANOVA assumptions)
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(sampledata.GH_mono$SMC_perc_dryweight_noOut)
+hist(sampledata.GH_mono$SMC_perc_dryweight_noOut)
+lm = lm((SMC_perc_dryweight_noOut) ~ treatment, data = sampledata.GH_mono)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# 2) homoegeneity of variances
+bartlett.test((SMC_perc_dryweight) ~ treatment , data = sampledata.GH_mono) 
+
+# Anova - >2factors with normal residuals and variances 
+smc_model.mono <- lm(SMC_perc_dryweight_noOut ~ treatment, data = sampledata.GH_mono)
+plot(smc_model.mono)
+Anova(smc_model.mono, type = "III")
+
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(smc_model.mono,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+
+# Summarize means  
+SMC_means <- sampledata.GH_mono %>%
+  group_by(treatment) %>%
+  summarize(MeanSMC = (mean(SMC_perc_dryweight_noOut, na.rm = T)))
+SMC_means
+
+
+# fold difference between SL-S and average of others 
+avg <- mean(38.7,41,37.9)
+(avg-22.2)/avg # 42% lower 
+
+```
+
+## NO3
+### check for outliers 
+```{r}
+IQR.outliers <- function(x) {
+  if(any(is.na(x)))
+    stop("x is missing values")
+  if(!is.numeric(x))
+    stop("x is not numeric")
+  Q3<-quantile(x,0.75)
+  Q1<-quantile(x,0.25)
+  IQR<-(Q3-Q1)
+  left<- (Q1-(3*IQR))
+  right<- (Q3+(3*IQR))
+  c(x[x <left],x[x>right])
+}
+
+sampledata.GH_noinitial <- filter(sampledata.GH, treatment != "InitialSoil")
+IQR.outliers(sampledata.GH_noinitial$NO3_ppm) 
+
+# not sure if this is valid though because the model is zero-inflated
+
+```
+
+### Focal Treatments
+```{r}
+# test for normal residuals and equal variances (ANOVA assumptions)
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(sampledata.GH_focal$NO3_ppm)
+hist(sampledata.GH_focal$NO3_ppm)
+
+lm = lm(sqrt(NO3_ppm) ~ treatment, data = sampledata.GH_focal)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = lm$residuals 
+shapiro.test(res) 
+
+# 2) homoegeneity of variances
+bartlett.test(sqrt(NO3_ppm) ~ treatment , data = sampledata.GH_focal) 
+
+# Anova - >2factors with normal residuals and variances 
+no3_model.focal<- lm(sqrt(NO3_ppm) ~ treatment, data = sampledata.GH_focal)
+plot(no3_model.focal)
+
+Anova(no3_model.focal, type = "III")
+
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(no3_model.focal,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+
+```
+### Monocultures
+```{r}
+# filter so we don't have duplicate values per pot 
+sampledata.GH_mono <- filter(sampledata.GH, treatment == "SL_SL" | treatment == "BBS_BBS" | treatment == "S_S"|treatment == "JG_JG")
+
+sampledata.GH_mono <- sampledata.GH_mono %>%  distinct(potID, .keep_all = TRUE)
+dim(sampledata.GH_mono)
+
+
+ggplot(sample_data(sampledata.GH_mono), aes(y = NO3_ppm, x = treatment, fill = treatment)) +   geom_boxplot() + 
+ # scale_fill_manual(values = c("green4","chartreuse","blue1","darkmagenta","gold", "grey")) + 
+  labs(x = "", y = "Whole Pot NO3 (ppm)") +  
+  theme(axis.title.x = element_text(size = 25)) + 
+  scale_x_discrete(breaks=c("SL-0", "SL-SL", "SL-BBS", "SL-JG", "SL-S", "Control"),
+                      labels=c("No Neighbor", "Switchgrass", "Big Bluestem", "Junegrass", "Black-eyed Susan", "Control")) +
+  theme(axis.title.y = element_text(size = 20)) + 
+  theme(axis.text.x = element_text(size = 12, color = "black"))  + 
+  theme(axis.text.y = element_text(size = 18, color = "black"))  + 
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=2))+
+  theme(legend.text = element_text(size = 25)) + 
+  theme(legend.title = element_text(size = 40)) +  theme(legend.position="right") +#remove legend  
+  theme(plot.margin=unit(c(.5,1,.5,.5),"cm"))   # add margins
+ 
+
+  
+# test for normal residuals and equal variances (ANOVA assumptions)
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(sqrt(sampledata.GH_mono$NO3_ppm))
+hist(sqrt(sampledata.GH_mono$NO3_ppm))
+
+
+
+# Anova - >2factors with normal residuals and variances 
+no3_model.mono<- lm(sqrt(NO3_ppm) ~ treatment, data = sampledata.GH_mono)
+plot(no3_model.mono)
+
+Anova(no3_model.mono, type = "III")
+
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(no3_model.mono,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+
+
+## Non-parametric Kruskal-Wallis Test 
+kruskal.test(NO3_ppm ~treatment, data = sampledata.GH_mono)
+
+
+# Post Hoc Dunn Test 
+library(FSA)
+dunnTest(NO3_ppm ~ treatment,
+              data=sampledata.GH_mono,
+              method="bh")
+
+
+
+# Summarize means  
+no3 <- sampledata.GH_mono %>%
+  group_by(treatment) %>%
+  summarize(NO3_mean = (mean(NO3_ppm, na.rm = T)))
+no3
+
+# fold difference between plant and no plant control? 
+avg <- mean(0.00931, 0.0186, 0.00563)
+(0.0480-avg)/avg # 4
+
+
+
+```
+
+## Root CN - Focal
+```{r}
+# test for normal residuals and equal variances (ANOVA assumptions)
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(sampledata.GH_focal$Mean_Root_CN)
+hist(sampledata.GH_focal$Mean_Root_CN)
+focal_RootCN = lm(Mean_Root_CN ~ treatment, data = sampledata.GH_focal)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = focal_RootCN$residuals 
+shapiro.test(res) 
+
+plot(focal_RootCN) 
+
+# 2) homoegeneity of variances
+bartlett.test(Mean_Root_CN ~ treatment , data = sampledata.GH_focal) 
+
+Anova(focal_RootCN, type = "III")
+
+# tukeys comparison will give letter differentiation
+library(multcompView)
+library(lsmeans)
+
+marginal = lsmeans(focal_RootCN,
+                   ~ treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+
+# Summarize means  
+rootcn_means <- sampledata.GH_focal %>%
+  group_by(treatment) %>%
+  summarize(Mean_Root_CN = (mean(Mean_Root_CN, na.rm = T)))
+rootcn_means
+
+
+# fold difference between SL-S and average of others 
+avg <- mean(57,55.7,58.9,62.4)
+(94.6-avg)/avg # .659 = 66% more CN in SL-S than others
+
+
+```
+
+## Shoot CN - Focal 
+```{r}
+# use sampledata.GH_focal
+
+ggplot(sampledata.GH_focal, aes(y = Mean_Shoot_CN, x = treatment, fill = treatment)) +  
+  geom_boxplot() + 
+  scale_fill_manual(values = c("green4","chartreuse","blue1","darkmagenta","gold")) + 
+  labs(x = "", y = "Shoot C:N %") +  
+  theme(axis.title.x = element_text(size = 25)) + 
+  scale_x_discrete(breaks=c("SL-0", "SL-SL", "SL-BBS", "SL-JG", "SL-S"),
+                      labels=c("No Neighbor", "Switchgrass", "Big Bluestem", "Junegrass", "Black-eyed Susan")) +
+  theme(axis.title.y = element_text(size = 25)) + 
+  theme(axis.text.x = element_text(size = 20, color = "black"))  + 
+  theme(axis.text.y = element_text(size = 20, color = "black"))  + 
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=2))+
+  theme(legend.text = element_text(size = 25)) + 
+  theme(legend.title = element_text(size = 40)) +  theme(legend.position="none") +#remove legend  
+  theme(plot.margin=unit(c(.5,1,.5,.5),"cm"))   # add margins
+ 
+  
+  
+   
+
+# test for normal residuals and equal variances (ANOVA assumptions)
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(sampledata.GH_focal$Mean_Shoot_CN)
+hist(sampledata.GH_focal$Mean_Shoot_CN)
+focal_ShootCN = lm(Mean_Shoot_CN ~ treatment, data = sampledata.GH_focal)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = focal_ShootCN$residuals 
+shapiro.test(res) 
+# Mean_Shoot_CN, treatment, p = 0.9 
+
+plot(focal_ShootCN) # looks fine - may be 1 outlier
+
+# 2) homoegeneity of variances
+bartlett.test(Mean_Shoot_CN ~ treatment , data = sampledata.GH_focal) 
+# Mean_Shoot_CN, treatment p = 0.04
+
+library(car)
+Anova(focal_ShootCN, type = "III")
+#Anova Table (Type III tests)
+#Response: Mean_Shoot_CN
+#                Sum Sq Df F value    Pr(>F)    
+#(Intercept)     4544.3  1 135.179 2.372e-10 ***
+#treatment 1472.7  4  10.952 7.200e-05 ***
+#Residuals        672.3 20     
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+
+marginal = lsmeans(focal_ShootCN,
+                   ~ treatment)
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+#treatment lsmean   SE df lower.CL upper.CL .group
+# SL-BBS            29.5 2.59 20     22.2     36.9  a    
+ #SL-JG             29.8 2.59 20     22.4     37.2  a    
+ #SL-0              30.1 2.59 20     22.8     37.5  a    
+ #SL-SL             33.6 2.59 20     26.2     40.9  a    
+ #SL-S              49.6 2.59 20     42.2     57.0   b   
+
+
+# Summarize means  
+ sampledata.GH_focal %>%
+  group_by(treatment) %>%
+  summarize(Mean_Shoot_CN = (mean(Mean_Shoot_CN, na.rm = T)))
+#<fct>             <dbl>
+#1 SL_0               30.1
+#2 SL_BBS             29.5
+#3 SL_JG              29.8
+#4 SL_S               49.6
+#5 SL_SL              33.6
+
+ # fold difference between SL-S and average of others 
+avg <- mean(30.1, 29.5, 29.8, 33.6)
+(49.6-avg)/avg # .647 = 65 % more shoot C:N in SL_S
+
+```
+
+## Microbial biomass carbon 
+
+### Focal treatments 
+```{r}
+ugC_MicBiomass_g_dry_soil_lm.focal.noctrl = lm(ugC_MicBiomass_g_dry_soil ~ treatment, data = sampledata.GH_focal)
+dim(sampledata.GH_focal)
+
+plot(ugC_MicBiomass_g_dry_soil_lm.focal.noctrl)
+
+Anova(ugC_MicBiomass_g_dry_soil_lm.focal.noctrl, type = "III")
+
+
+emmeans(ugC_MicBiomass_g_dry_soil_lm.focal.noctrl, pairwise ~ treatment, adjust = "fdr")
+
+
+```
+### Monoculture Treatments
+```{r}
+# put samples in order 
+sampledata.GH.focal.mono <- filter(sampledata.GH, treatment == "SL_SL" | treatment == "S_S" | treatment == "BBS_BBS" | treatment == "JG_JG")
+
+sampledata.GH.focal.cntrl$treatment <- factor(sampledata.GH.focal.cntrl$treatment, levels =  c("SL_SL", "BBS_BBS","JG_JG", "S_S"))
+
+# select distinct pots, because this is a pot-level measurement 
+sampledata.GH.focal.mono <- distinct(sampledata.GH.focal.mono, potID, .keep_all = TRUE)
+
+dim(sampledata.GH.focal.mono)
+
+# test for normal residuals and equal variances (ANOVA assumptions)
+library(ggpubr)
+# 1) normal residuals
+ggqqplot(sampledata.GH.focal.mono$ugC_MicBiomass_g_dry_soil)
+hist(sampledata.GH.focal.mono$ugC_MicBiomass_g_dry_soil)
+ugC_MicBiomass_g_dry_soil_lm.mono = lm(ugC_MicBiomass_g_dry_soil ~ treatment, data = sampledata.GH.focal.mono)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = ugC_MicBiomass_g_dry_soil_lm.mono$residuals 
+shapiro.test(res) 
+
+plot(ugC_MicBiomass_g_dry_soil_lm.mono) # looks fine 
+
+# 2) homoegeneity of variances
+bartlett.test(ugC_MicBiomass_g_dry_soil ~ treatment , data = sampledata.GH.focal.cntrl) 
+
+Anova(ugC_MicBiomass_g_dry_soil_lm.mono, type = "III")
+
+# pairwise test (gives you p.values for every combination)
+emmeans(ugC_MicBiomass_g_dry_soil_lm.mono, pairwise ~ treatment, adjust = "fdr")
+
+
+# tukeys comparison will give letter differentiation
+library(multcompView)
+library(lsmeans)
+
+marginal = lsmeans(ugC_MicBiomass_g_dry_soil_lm.mono,
+                   ~ treatment)
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  Tukey-adjusted comparisons
+CLD
+
+
+
+
+```
+---
+
+# SOIL INCUBATION METADATA 
+
+ 
+```{r}
+# read in DOC/TN/Mbio data
+MBio <- read.csv("C:/Users/Tayler Ulbrich/Documents/01_Grad School/02_Projects/04_Neighbor Identity Experiments/03_SmallPots_NeighborExudate/Soil Incubation/Data/TOC/2020.02.03_NeighIDsoilInc_MicBiomass.csv", header = TRUE)
+# Rename column
+names(MBio)[names(MBio) == "ExudateTrt_Number"] <- "ExudateIDNumber"
+
+# change all neg values to NA 
+#MBio[,-1][MBio[,-1]<0] <- "NA"
+# change INF to NA 
+#MBio[,-1][MBio[,-1]=="Inf"] <- NA
+
+# Merge with metadata 
+trtdata <- read.csv("C:/Users/Tayler Ulbrich/Documents/01_Grad School/02_Projects/04_Neighbor Identity Experiments/03_SmallPots_NeighborExudate/Soil Incubation/Data/Metadata/NeighIDSoilInc_metadata.csv", header = TRUE)
+
+MBio_meta <- merge(MBio, trtdata, by = "ExudateIDNumber")
+dim(MBio_meta) #41 15 
+
+# reorder treatments for all plots 
+MBio_meta$ExudateName <- factor(MBio_meta$ExudateName , levels = c("CaCl2","Water", "MA_high", "MA_low","SL-0","SL-SL","SL-BBS","SL-JG","SL-S"))
+dim(MBio_meta)
+
+MBio_meta_MA <- filter(MBio_meta, ExudateName == "MA_high" | ExudateName == "MA_low")
+dim(MBio_meta_MA)
+
+```
+
+
+## Microbial Biomass Carbon
+```{r}
+# make sure the data is numeric 
+sampledata.SoilInc.sub$ugC_MicBiomass_g_dry_soil <- as.numeric(sampledata.SoilInc.sub$ugC_MicBiomass_g_dry_soil)
+
+library("ggpubr")
+# test for normal residuals and equal variances (ANOVA assumptions)
+# 1) normal residuals
+ggqqplot(sampledata.SoilInc.sub$ugC_MicBiomass_g_dry_soil)
+hist(sampledata.SoilInc.sub$ugC_MicBiomass_g_dry_soil)
+
+model = lm(ugC_MicBiomass_g_dry_soil~ treatment, data = sampledata.SoilInc.sub)
+res = model$residuals 
+shapiro.test(res) 
+
+# 2) homoegeneity of variances
+bartlett.test(ugC_MicBiomass_g_dry_soil~ treatment, data = sampledata.SoilInc.sub)
+
+### ANALYSIS
+# Anova - Does MBC differ by plant treatment? 
+library(car)
+MBC_model <- lm(ugC_MicBiomass_g_dry_soil ~ treatment, data = sampledata.SoilInc.sub)
+MBC_model
+
+Anova(MBC_model, Type = III)
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+marginal = lsmeans(MBC_model,
+                   ~treatment)
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  tukey-adjusted comparisons
+CLD
+
+```
+
+## Microbial Biomass Nitrogen
+```{r}
+# make sure the data is numeric 
+sampledata.SoilInc.sub$ugN_MicBiomass_g_dry_soil <- as.numeric(sampledata.SoilInc.sub$ugN_MicBiomass_g_dry_soil)
+
+
+library("ggpubr")
+# test for normal residuals and equal variances (ANOVA assumptions)
+# 1) normal residuals
+ggqqplot(sampledata.SoilInc.sub$ugN_MicBiomass_g_dry_soil)
+hist(sampledata.SoilInc.sub$ugN_MicBiomass_g_dry_soil)
+
+model = lm(ugN_MicBiomass_g_dry_soil~ treatment, data = sampledata.SoilInc.sub)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = model$residuals 
+shapiro.test(res) 
+
+# 2) homoegeneity of variances
+bartlett.test(ugN_MicBiomass_g_dry_soil~ treatment, data = sampledata.SoilInc.sub)
+
+### ANALYSIS
+# Anova - Does MBC differ by plant treatment? 
+library(car)
+MBN_model <- lm(ugN_MicBiomass_g_dry_soil ~ treatment, data = sampledata.SoilInc.sub)
+MBN_model
+
+Anova(MBN_model, Type = "III")
+
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+marginal = lsmeans(MBN_model,
+                   ~treatment)
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         
+CLD
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+# Summarize means  
+ sampledata.SoilInc.sub %>%
+  group_by(treatment) %>%
+  summarize(mean = (mean(ugN_MicBiomass_g_dry_soil, na.rm = T)))
+
+
+
+
+```
+
+## MBC:N
+```{r}
+# First calculate MBC:N ratio
+
+sampledata.SoilInc.sub$MBC_CN <- sampledata.SoilInc.sub$ugC_MicBiomass_g_dry_soil/sampledata.SoilInc.sub$ugN_MicBiomass_g_dry_soil
+
+library("ggpubr")
+# test for normal residuals and equal variances (ANOVA assumptions)
+# 1) normal residuals
+ggqqplot(sampledata.SoilInc.sub$MBC_CN)
+hist(sampledata.SoilInc.sub$MBC_CN)
+
+model = lm(MBC_CN~ treatment, data = sampledata.SoilInc.sub)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = model$residuals 
+shapiro.test(res) 
+
+# 2) homoegeneity of variances
+bartlett.test(MBC_CN ~ treatment, data = sampledata.SoilInc.sub)
+
+### ANALYSIS
+# Anova - Does MBC differ by plant treatment? 
+library(car)
+MBCn_model <- lm(MBC_CN ~ treatment, data = sampledata.SoilInc.sub)
+MBCn_model
+
+Anova(MBCn_model, Type = "III")
+
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+marginal = lsmeans(MBCn_model,
+                   ~treatment)
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  tukey-adjusted comparisons
+CLD
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+
+# Summarize means  
+ sampledata.SoilInc.sub %>%
+  group_by(treatment) %>%
+  summarize(Mean_MBC_CN = (mean(MBC_CN, na.rm = T)))
+# high = 8.52, low = 13.2, water = 10.3 
+ 
+ 
+```
+
+## DOC 
+```{r}
+# make sure the data is numeric 
+sampledata.SoilInc.sub$unfumigated_DOC_concentration_ugC_gsoil <- as.numeric(sampledata.SoilInc.sub$unfumigated_DOC_concentration_ugC_gsoil)
+
+library("ggpubr")
+# test for normal residuals and equal variances (ANOVA assumptions)
+# 1) normal residuals
+ggqqplot(log(sampledata.SoilInc.sub$unfumigated_DOC_concentration_ugC_gsoil))
+hist(log(sampledata.SoilInc.sub$unfumigated_DOC_concentration_ugC_gsoil)) # extreme right skew
+
+
+model = lm(log(unfumigated_DOC_concentration_ugC_gsoil) ~ treatment, data = sampledata.SoilInc.sub)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = model$residuals 
+shapiro.test(res) 
+
+# 2) homoegeneity of variances
+bartlett.test(log(unfumigated_DOC_concentration_ugC_gsoil) ~ treatment, data = sampledata.SoilInc.sub)
+
+
+### ANALYSIS -  log transform!
+# Anova - Does DOC differ by Treatment? 
+library(car)
+DOC_model <- lm(log(unfumigated_DOC_concentration_ugC_gsoil) ~ treatment, data = sampledata.SoilInc.sub)
+DOC_model
+
+Anova(DOC_model, Type = III)
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+marginal = lsmeans(DOC_model,
+                   ~treatment)
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  tukey-adjusted comparisons
+CLD
+
+
+# Summarize means  
+si.doc_means <- sampledata.SoilInc.sub %>%
+  group_by(treatment) %>%
+  summarize(mean_doc = (mean(unfumigated_DOC_concentration_ugC_gsoil, na.rm = T)))
+si.doc_means
+# fold difference between SL-S and average of others 
+avg <- (258 + 129)/2
+(avg-52.9)/52.9 # .659 = 66% more CN in SL-S than others
+
+
+
+
+```
+
+## TN 
+```{r}
+# make sure the data is numeric 
+sampledata.SoilInc.sub$unfumigated_TN_concentration_ugN_gsoil <- as.numeric(sampledata.SoilInc.sub$unfumigated_TN_concentration_ugN_gsoil)
+
+library("ggpubr")
+# test for normal residuals and equal variances (ANOVA assumptions)
+# 1) normal residuals
+ggqqplot((sampledata.SoilInc.sub$unfumigated_TN_concentration_ugN_gsoil))
+hist((sampledata.SoilInc.sub$unfumigated_TN_concentration_ugN_gsoil)) # extreme right skew
+
+
+model = lm((unfumigated_TN_concentration_ugN_gsoil) ~ treatment, data = sampledata.SoilInc.sub)
+# shapiro test - null hypothesis: residuals are normally distributed 
+res = model$residuals 
+shapiro.test(res) 
+
+# 2) homoegeneity of variances
+bartlett.test((unfumigated_TN_concentration_ugN_gsoil) ~ treatment, data = sampledata.SoilInc.sub)
+
+
+### ANALYSIS -  log transform!
+# Anova - Does DOC differ by Treatment? 
+library(car)
+TN_model <- lm((unfumigated_TN_concentration_ugN_gsoil) ~ treatment, data = sampledata.SoilInc.sub)
+TN_model
+
+Anova(TN_model, Type = III)
+
+# tukeys comparison will give letter differentiation
+library(multcomp)
+library(lsmeans)
+marginal = lsmeans(TN_model,
+                   ~treatment)
+CLD = cld(marginal,
+          alpha=0.05,
+          Letters=letters,        ### Use lower-case letters for .group
+          adjust="fdr")         ###  tukey-adjusted comparisons
+CLD
+
+
+contrast(marginal, alpha=0.05, method="pairwise", adjust="fdr") # pvalues 
+
+
+# Summarize means  
+ sampledata.SoilInc.sub %>%
+  group_by(treatment) %>%
+  summarize(mean = (mean(unfumigated_TN_concentration_ugN_gsoil, na.rm = T)))
+
+
+
+```

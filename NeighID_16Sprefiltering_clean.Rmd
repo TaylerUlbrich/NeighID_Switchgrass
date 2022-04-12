@@ -1,0 +1,429 @@
+---
+title: "NeighID_16Sprefiltering_clean.Rmd"
+author: "Tayler Ulbrich"
+date: "4/7/2022"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+  
+---
+
+
+**This R code does pre-filtering for 16S samples, including removing singletons, as well as rarefying. Phyloseq objects are split into the greenhouse (GH) samples (focal and monoculture treatments) & soil incubation samples (soilinc)**
+
+*only a subset of the soilinc samples were used for this publication - water control, high malic acid, and low malic acid treatments*
+
+
+
+# Set working directory and load packages
+```{r load_packages, include=F}
+
+setwd("C:/Users/Tayler Ulbrich/Documents/GitHub/SwitchgrassNeighborRhizosphere/")
+
+library(phyloseq)
+library(ggplot2)
+library(vegan)
+library(lme4)
+theme_set(theme_classic())
+
+```
+---
+
+# 1) Make phyloseq object with otu table, taxa file, and tree file 
+```{r}
+
+# this metadata denotes which samples belong to which experiment (GH or Soilinc), as well as additional metadata used for either experiment in later analyses 
+
+metadata <- read.csv("Metadata/Ulbrich_NeighID_Metadata_Published.csv",header =TRUE)
+dim(metadata) 
+
+# make sure that all data that should be numeric is 
+# make sure that columns are numeric (columns 14-34 are factors and should be numeric)
+i <- c(14:34) # which columns to change 
+metadata[,i] <- apply(metadata[, i], 2, 
+                      function(x) as.numeric(as.character(x)))
+# There are NAs because not all metadata was collected for both GH and SoilInc experiments 
+
+
+SAMP <- sample_data(metadata) 
+rownames(SAMP) <- SAMP$X.SampleID # row names must match OTU table
+
+# load otu file 
+otufile <- read.table("Final_otu_tax_tree_files/Ulbrich_NeighID_GH_SoilInc_16S_OTUtable.txt", header = TRUE)
+otu <- otu_table(otufile, taxa_are_rows = TRUE)
+dim(otu)
+
+# load taxa file 
+taxafile <- as.matrix(read.table("Final_otu_tax_tree_files/Ulbrich_NeighID_GH_SoilInc_16S_TAXtable.txt", header = TRUE, row.names = 1))
+tax <- tax_table(taxafile)
+dim(tax) 
+
+# load tree file - created with 'PASTA' [Mirareb et al. 2015](https://github.com/smirarab/pasta)
+tree <- "Final_otu_tax_tree_files/Ulbrich_NeighID_GH_SoilInc_PASTA_16S_tree.tre"
+
+tree_otu <- read_tree(tree, errorIfNULL = TRUE)
+taxa_names(tree_otu)
+
+
+# combine data into phyloseq-object (include map, otu, tax, tree)
+myphy<- merge_phyloseq(otu, tax, SAMP, tree_otu)
+sampledata <- as(sample_data(myphy), "data.frame")
+
+```
+
+# 2) Rename column names (taxa) and clean up OTUS (remove 0 abundance OTUS and remove any non-bacterial reads)
+```{r}
+#what are the column names of our taxonomy file? 
+colnames(tax_table(myphy)) 
+
+# remove any taxa that aren't in my samples (e.g. OTUS found in samples ran on the same run)
+otus.mine <- prune_taxa(taxa_sums(myphy) > 0, myphy)
+ntaxa(myphy) - ntaxa(otus.mine) 
+
+# subset for only bacteria and remove any mitochondria and chloroplast 
+bact.p <- subset_taxa(otus.mine, Kingdom== "Bacteria" & 
+                      Family != "Mitochondria" &
+                      Class != "Chloroplast")
+
+ntaxa(bact.p)- ntaxa(otus.mine) 
+ntaxa(bact.p) 
+# % of reads that were non-bacterial 
+100*(1- sum(sample_sums(bact.p))/sum(sample_sums(otus.mine))) #2.33
+
+
+```
+
+# 3) Remove Singletons & low sequence coverage samples 
+```{r}
+# what is the difference in library size ? 
+sort(sample_sums(bact.p))  
+
+# Blanks only have 1, 8, 13 reads -- remove these samples 
+bact.p <- prune_samples(sample_sums(bact.p) > 14, bact.p) 
+sort(sample_sums(bact.p)) 
+
+max(sample_sums(bact.p))/min(sample_sums(bact.p)) #2.7 fold diff in library size -- leave all samples 
+
+# remove singletons
+bact.pp <- prune_taxa(taxa_sums(bact.p) > 1, bact.p)
+ntaxa(bact.pp) - ntaxa(bact.p) 
+ntaxa(bact.pp) 
+
+
+# reset sampledata with the blanks removed
+sampledata <- as.data.frame(as(sample_data(bact.pp),"matrix"))
+
+```
+
+#4) Split into GH and SoilInc Phyloseq objects 
+```{r}
+# Split and add column that is the reads of each sample 
+sampledata$reads = sample_sums(bact.pp) 
+
+bact.pp_GH <- subset_samples(bact.pp, Experiment == "Greenhouse")
+bact.pp_SoilInc <- subset_samples(bact.pp, Experiment == "SoilIncubation")
+
+# sampledata for each data subset 
+sampledata_GH <- as(sample_data(bact.pp_GH), "data.frame")
+sampledata_GH$reads = sample_sums(bact.pp_GH)
+dim(sampledata_GH) 
+
+sampledata_SoilInc <-  as(sample_data(bact.pp_SoilInc), "data.frame")
+sampledata_SoilInc$reads = sample_sums(bact.pp_SoilInc)
+dim(sampledata_SoilInc) 
+
+## SAVE THESE FILES 
+#save(bact.pp, file ="PhyloseqObjects/NeighID_all_16S_Nosingles_raw.Rdata")
+#save(bact.pp_GH, file ="PhyloseqObjects/NeighID_GH_16S_Nosingles_raw.Rdata")
+#save(bact.pp_SoilInc, file ="PhyloseqObjects/NeighID_SoilInc_16S_Nosingles_raw.Rdata")
+
+
+```
+# 5) Compare Sequencing Runs 
+```{r}
+#The two experiments were on two separate Miseq runs, samples from run 1 (GH) were included on run 2 with soilinc samples to confirm that there weren't issues due to sequencing
+
+
+# Run1 SAMPLES: TMCneighID1, TMCneighID17, TMCneighID18, TMCneighID25, TMCneighID9
+# RUN2 SAMPLES: TCUneighID1, TCUneighID17, TCUneighID18, TCUneighID25, TCUneighID9
+
+bact.pp_subset <- subset_samples(bact.pp, X.SampleID == "TCUneighID1" | X.SampleID == "TCUneighID17" | X.SampleID == "TCUneighID18" | X.SampleID == "TCUneighID25" | X.SampleID == "TCUneighID9" |X.SampleID == "TMCneighID1" | X.SampleID == "TMCneighID17" | X.SampleID == "TMCneighID18" | X.SampleID == "TMCneighID25" | X.SampleID == "TMCneighID9" )
+nsamples(bact.pp_subset) #10 
+
+# transform data to relative abundance 
+bact.pp_subset.ra <- transform_sample_counts(bact.pp_subset, function(x) x/sum(x))
+
+
+sample_data(bact.pp_subset.ra)$x.SampleID <- factor(sample_data(bact.pp_subset.ra)$X.SampleID , levels = c("TMCneighID1","TCUneighID1", "TMCneighID17", "TCUneighID17", "TMCneighID18","TCUneighID18", "TMCneighID25", "TCUneighID25", "TMCneighID9","TCUneighID9"))
+sample_data(bact.pp_subset.ra)$DuplicateRep <- c("1","2","3","4","5","1","2","3","4","5")
+
+colors_run <- c("blue","blue","blue","blue","blue", "red", "red", "red","red","red")
+
+
+# Distances for Ordination 
+# look for stress values around 0.2
+# Goal is to use the min.#axes for which stress is low
+set.seed(2)
+bact.pp_subset.ra_brayNMDS <- ordinate(bact.pp_subset.ra, method = "NMDS", distance = "bray" ) # noconvergence stress = 0.14
+# stress = 0.08
+
+# plot Ordination 
+ plot_ordination(bact.pp_subset.ra, ordination = bact.pp_subset.ra_brayNMDS, color = "DuplicateRep") + 
+  geom_point(size = 5)+ 
+ # scale_color_manual(values = colors_run) +
+   geom_text(label = sample_data(bact.pp_subset.ra)$X.SampleID) +
+  theme(plot.title = element_text(size = 16)) + 
+  theme(axis.title.x = element_text(size = 25)) + 
+  theme(axis.title.y = element_text(size = 25)) + 
+  theme(axis.text.x = element_text(size = 20, color = "black"))  + 
+  theme(axis.text.y = element_text(size = 20, color = "black"))  + 
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=2))+
+  theme(legend.text = element_text(size = 25)) + 
+  theme(legend.position="right")+  # legend.title = element_text(size = 40)) # +
+  theme(plot.margin=unit(c(.5,1,.5,.5),"cm"))  # add margins
+  #scale_y_continuous(labels = scales::number_format(accuracy = 0.01)) + 
+   #scale_x_continuous(labels = scales::number_format(accuracy = 0.01)) # change axes to only have 2 decimals
+
+
+ # PERMANOVA 
+set.seed(2)
+bact.pp_subset.ra_bray <- phyloseq::distance(bact.pp_subset.ra,"bray")
+
+set.seed(2)
+permanova <- adonis(bact.pp_subset.ra_bray~sample_data(bact.pp_subset.ra)$DuplicateRep + sample_data(bact.pp_subset.ra)$SequencingRun, permutations = 9999, method = "bray")
+permanova
+
+```
+
+# 6) Investigate Library Sizes
+```{r}
+
+
+# What does the total reads per sample distribution look like? 
+
+# All samples split by experiment 
+ggplot(sampledata, aes(x = reads )) +   # Histogram of sample read counts 
+  geom_histogram(color = "black", fill = "indianred", binwidth = 2500) + 
+  facet_grid(.~ Experiment) + # Split by Experiment 
+  ggtitle("Distribution of sample sequencing depth of otus") + 
+   xlab("Read counts") + 
+  theme(axis.title.y = element_blank())
+  
+################### 
+# Look at differences between GH and SoilInc experiment
+
+### GREENHOUSE
+# mean, max, min, median of sample read counts to inform normalization techniques 
+nsamples(bact.pp_GH) #88 
+min(sample_sums(bact.pp_GH)) 
+mean(sample_sums(bact.pp_GH)) 
+max(sample_sums(bact.pp_GH))  
+median(sample_sums(bact.pp_GH))
+sum(sample_sums(bact.pp_GH))  
+
+
+### SOIL INCUBATION 
+# mean, max, min, median of sample read counts to inform normalization techniques 
+nsamples(bact.pp_SoilInc) 
+min(sample_sums(bact.pp_SoilInc)) 
+mean(sample_sums(bact.pp_SoilInc)) 
+max(sample_sums(bact.pp_SoilInc))  
+median(sample_sums(bact.pp_SoilInc)) 
+sum(sample_sums(bact.pp_SoilInc))  
+
+#########################
+# Rarefaction Curves 
+#########################
+# ALL SAMPLES 
+
+# Rarefaction curve for every sample 
+otus.tab=t(as(otu_table(bact.pp), "matrix"))
+otus.map=sample_data(bact.pp)
+row.names(otus.tab)=otus.map$X.SampleID 
+raremax <- min(rowSums(otus.tab)) #  2026 - this is the min read number 
+raremax # 16224
+rarecurve <- rarecurve(otus.tab, step = 1000, sample = raremax,label = FALSE)
+
+##########
+# Richness * Read # for all samples (colored by treatment )
+sampledata_all <- as.data.frame(as(sample_data(bact.pp),"matrix"))
+sampledata_all$samplesums <- sample_sums(bact.pp)
+
+Observed <- estimate_richness(bact.pp, measures = "Observed")
+library(tibble)
+Observed <- rownames_to_column(Observed, "X.SampleID")
+sampledata_all <- merge(sampledata_all, Observed, by = "X.SampleID" )
+
+# find min read # that you could rarefy to 
+raremax = min(sampledata_all$samplesums) 
+raremax # 16224 
+
+# Plot rarefcation curve, richness * read # 
+require(ggplot2)
+ggplot(sampledata_all, aes(x= samplesums, y = Observed, color = Experiment)) + 
+    geom_point(size = 4) + 
+  ggtitle("Rarefaction curve for all bacterial reads") + 
+  labs(x = "Total Reads", y = "Observed Richness")+
+ # geom_text(label = sampledata_bact.ppp_pruned$X.SampleID) +
+  geom_vline(xintercept = raremax, color = "red", size = 1.5) + 
+  theme(
+  plot.title = element_text(size = 30), 
+  axis.title.x = element_text(size = 25), 
+  axis.title.y = element_text(size = 25), 
+  axis.text.x = element_text(size = 10, color = "black"),
+  axis.text.y = element_text(size = 20, color = "black"), 
+  axis.ticks.x = element_blank(),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 20),
+  legend.title = element_text(size = 20))# add visual line of where you could rarefy to min. read #
+
+
+
+######
+# GH experiment only 
+######
+# Rarefaction curve for every sample 
+otus.tab=t(as(otu_table(bact.pp_GH), "matrix"))
+otus.map=sample_data(bact.pp_GH)
+row.names(otus.tab)=otus.map$X.SampleID 
+raremax <- min(rowSums(otus.tab))
+raremax # 17337
+rarecurve <- rarecurve(otus.tab, step = 1000, sample = 16224,label = FALSE) # change raremax to 16224 to be comparable with final dataset
+
+##########
+# Richness * Read # for all samples (colored by treatment )
+sampledata_GH <- as.data.frame(as(sample_data(bact.pp_GH),"matrix"))
+sampledata_GH$samplesums <- sample_sums(bact.pp_GH)
+
+Observed <- estimate_richness(bact.pp_GH, measures = "Observed")
+library(tibble)
+Observed <- rownames_to_column(Observed, "X.SampleID")
+sampledata_GH <- merge(sampledata_GH, Observed, by = "X.SampleID" )
+
+# find min read # that you could rarefy to 
+raremax = min(sampledata_GH$samplesums) 
+raremax  
+
+# Plot rarefcation curve, richness * read # 
+require(ggplot2)
+ggplot(sampledata_GH, aes(x= samplesums, y = Observed, color = treatment, label = X.SampleID)) + 
+   # geom_point(size = 4) + 
+  geom_text(aes(label= X.SampleID)) +
+  ggtitle("Rarefaction curve for all GH reads") + 
+  labs(x = "Total Reads", y = "Observed Richness")+
+ # geom_text(label = sampledata_bact.pp_GHp_pruned$X.SampleID) +
+  geom_vline(xintercept = 16224, color = "red", size = 1.5) +  # cutoff of 16224 was used for all samples to include soil inc data
+  theme(
+  plot.title = element_text(size = 30), 
+  axis.title.x = element_text(size = 25), 
+  axis.title.y = element_text(size = 25), 
+  axis.text.x = element_text(size = 10, color = "black"),
+  axis.text.y = element_text(size = 20, color = "black"), 
+  axis.ticks.x = element_blank(),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 20),
+  legend.title = element_text(size = 20))# add visual line of where you could rarefy to min. read #
+
+
+
+## Differences in library size among treatments? 
+
+ggqqplot(sampledata_GH$samplesums)
+hist(sampledata_GH$samplesums)
+
+libsize = lm(samplesums ~ treatment , data =sampledata_GH)
+res = resid(libsize)
+shapiro.test(res) 
+
+Anova(libsize, type = "III")
+
+
+
+######
+# SoilInc experiment only 
+######
+# Rarefaction curve for every sample 
+otus.tab=t(as(otu_table(bact.pp_SoilInc), "matrix"))
+otus.map=sample_data(bact.pp_SoilInc)
+row.names(otus.tab)=otus.map$X.SampleID 
+raremax <- min(rowSums(otus.tab))
+raremax # 16224
+rarecurve <- rarecurve(otus.tab, step = 1000, sample = raremax,label = FALSE)
+
+##########
+# Richness * Read # for all samples (colored by treatment )
+sampledata_SoilInc <- as.data.frame(as(sample_data(bact.pp_SoilInc),"matrix"))
+sampledata_SoilInc$samplesums <- sample_sums(bact.pp_SoilInc)
+
+Observed <- estimate_richness(bact.pp_SoilInc, measures = "Observed")
+library(tibble)
+Observed <- rownames_to_column(Observed, "X.SampleID")
+sampledata_SoilInc <- merge(sampledata_SoilInc, Observed, by = "X.SampleID" )
+
+# find min read # that you could rarefy to 
+raremax = min(sampledata_SoilInc$samplesums) 
+raremax  
+
+# Plot rarefcation curve, richness * read # 
+require(ggplot2)
+ggplot(sampledata_SoilInc, aes(x= samplesums, y = Observed, color = treatment)) + 
+    geom_point(size = 4) + 
+  ggtitle("Rarefaction curve for all SoilInc reads") + 
+  labs(x = "Total Reads", y = "Observed Richness")+
+ # geom_text(label = sampledata_bact.pp_SoilIncp_pruned$X.SampleID) +
+  geom_vline(xintercept = raremax, color = "red", size = 1.5) + 
+  theme(
+  plot.title = element_text(size = 30), 
+  axis.title.x = element_text(size = 25), 
+  axis.title.y = element_text(size = 25), 
+  axis.text.x = element_text(size = 10, color = "black"),
+  axis.text.y = element_text(size = 20, color = "black"), 
+  axis.ticks.x = element_blank(),
+  panel.border = element_rect(colour = "black", fill=NA, size=2),
+  legend.text = element_text(size = 20),
+  legend.title = element_text(size = 20))# add visual line of where you could rarefy to min. read #
+
+
+```
+
+# 6) Rarefy Normalization
+```{r}
+
+min(sample_sums(bact.pp)) # 16224 
+min(sample_sums(bact.pp_GH)) # 17337 
+min(sample_sums(bact.pp_SoilInc)) # 16224 
+
+# RAREFY ALL TO 16224 
+
+# NOTE: We did not use set.seed(#) when we first rarefied this data set for analyses, so this code may not generate the exact same dataset. However, we confirmed that the analyses do not change in significance or magnitude. To replicate the *exact* results we have, please use the rarefied dataset found in PhyloseqObjects/NeighID_*_rfy_pub.Rdata
+
+set.seed(2)
+bact.rfy <- rarefy_even_depth(bact.pp, sample.size = 16224, replace = FALSE, rngseed = TRUE)
+  
+
+
+## subset for gh and soil inc 
+bact.rfy_GH <- subset_samples(bact.rfy, Experiment == "Greenhouse")
+nsamples(bact.rfy_GH)  
+ntaxa(bact.rfy_GH)
+
+bact.rfy_SoilInc <- subset_samples(bact.rfy, Experiment == "SoilIncubation")
+nsamples(bact.rfy_SoilInc) 
+
+
+```
+# 7) Remove OTUS not present in at least 10 samples 
+```{r}
+# All samples 
+bact.rfy <- prune_taxa(taxa_sums(bact.rfy) >= 10, bact.rfy)
+
+# Greenhouse samples only (bact.rfy_GH)
+bact.rfy_GH <- prune_taxa(taxa_sums(bact.rfy_GH) >= 10, bact.rfy_GH)
+ntaxa(bact.rfy_GH)
+
+# Soil Incubation samples only (bact.rfy_SoilInc)
+bact.rfy_SoilInc <- prune_taxa(taxa_sums(bact.rfy_SoilInc) >= 10, bact.rfy_SoilInc)
+ntaxa(bact.rfy_SoilInc)
+
+
+```
